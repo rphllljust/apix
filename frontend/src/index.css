@@ -1,0 +1,35 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=Space+Grotesk:wght@400;500;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    font-family: 'Space Grotesk', 'Trebuchet MS', sans-serif;
+    color: #1a2f2f;
+    background-color: #f4efe7;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  * {
+    @apply box-border;
+  }
+
+  body {
+    @apply m-0 min-h-screen bg-bg text-ink;
+  }
+
+  #root {
+    @apply min-h-screen;
+  }
+
+  code,
+  pre,
+  .font-mono {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+}
+

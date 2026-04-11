@@ -1,0 +1,19 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+logs/
+data/
+credentials.json
+sync_state.db
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+frontend/.vite/
+frontend/.env
+
+# os/editor
+.DS_Store
+Thumbs.db
