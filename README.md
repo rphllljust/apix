@@ -18,7 +18,7 @@ A API faz:
 - Python `3.11+`
 - Docker e Docker Compose (opcional para deploy)
 - Moodle com Web Services REST ativos
-- Conta Google Cloud com Service Account
+- Conta Google Cloud com Service Account **ou** Google Apps Script Web App
 
 ## 1) Configuracao do Moodle
 
@@ -45,6 +45,31 @@ A API faz:
 6. Compartilhe a planilha de destino com o email da Service Account (permissao de Editor).
 7. Copie o `SPREADSHEET_ID` da URL da planilha.
 
+## Alternativa sem Google Cloud (Google Apps Script)
+
+Se voce nao quiser usar Google Cloud, da para integrar via Web App do Apps Script.
+
+1. Abra a planilha Google de destino.
+2. Va em `Extensoes > Apps Script`.
+3. Cole o conteudo de `scripts/google_apps_script_webhook.gs`.
+4. (Opcional) Em `Configuracoes do projeto > Propriedades do script`, crie:
+   - `APPS_SCRIPT_WEBHOOK_TOKEN` (segredo compartilhado)
+   - `SPREADSHEET_ID` (se o script for standalone em vez de vinculado a planilha)
+5. Publique em `Implantar > Nova implantacao > Aplicativo da Web`:
+   - Executar como: `Voce`
+   - Quem tem acesso: `Qualquer pessoa com o link`
+6. Copie a URL do Web App publicado e configure no `.env`:
+
+```bash
+GOOGLE_APPS_SCRIPT_WEBHOOK_URL=https://script.google.com/macros/s/SEU_DEPLOYMENT_ID/exec
+GOOGLE_APPS_SCRIPT_WEBHOOK_TOKEN=SEU_TOKEN_OPCIONAL
+GOOGLE_APPS_SCRIPT_TIMEOUT_SECONDS=20
+SPREADSHEET_ID=ID_DA_PLANILHA_GOOGLE
+GOOGLE_SPREADSHEET_ID=ID_DA_PLANILHA_GOOGLE
+```
+
+Quando `GOOGLE_APPS_SCRIPT_WEBHOOK_URL` estiver preenchido, a API usa o Apps Script em vez da autenticacao Google Cloud.
+
 ## 3) Configuracao do projeto
 
 1. Copie arquivo de ambiente:
@@ -64,6 +89,9 @@ cp .env.example .env
 - `GOOGLE_OAUTH_CLIENT_ID` (opcional para login Google Sheets via OAuth)
 - `GOOGLE_OAUTH_CLIENT_SECRET` (opcional para login Google Sheets via OAuth)
 - `GOOGLE_OAUTH_REDIRECT_URI` (ex.: `http://localhost:8000/api/v1/google-sheets/oauth/callback`)
+- `GOOGLE_APPS_SCRIPT_WEBHOOK_URL` (opcional, para modo sem Google Cloud)
+- `GOOGLE_APPS_SCRIPT_WEBHOOK_TOKEN` (opcional, recomendado para proteger o webhook)
+- `GOOGLE_APPS_SCRIPT_TIMEOUT_SECONDS` (opcional, padrao `20`)
 - `API_SECRET_KEY`
 - `CORS_ALLOWED_ORIGINS`
 

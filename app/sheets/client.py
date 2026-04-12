@@ -8,6 +8,7 @@ from datetime import date, datetime
 from typing import Any
 
 import gspread
+import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.oauth2.service_account import Credentials
@@ -52,6 +53,10 @@ class GoogleSheetsClient:
             and settings.google_oauth_client_secret
         )
 
+    @staticmethod
+    def _is_apps_script_configured(settings: Settings) -> bool:
+        return bool(str(settings.google_apps_script_webhook_url or "").strip())
+
     @classmethod
     def _build_credentials(cls, settings: Settings) -> Credentials | OAuthCredentials:
         if cls._is_oauth_configured(settings):
@@ -73,9 +78,59 @@ class GoogleSheetsClient:
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self._use_apps_script = self._is_apps_script_configured(settings)
+        self._apps_script_url = str(settings.google_apps_script_webhook_url or "").strip()
+        self._apps_script_token = str(settings.google_apps_script_webhook_token or "").strip()
+
+        if getattr(self, "_use_apps_script", False):
+            self._client = None
+            self._spreadsheet = None
+            return
+
         creds = self._build_credentials(settings)
         self._client = gspread.authorize(creds)
         self._spreadsheet = self._client.open_by_key(settings.google_spreadsheet_id)
+
+    def _apps_call(self, action: str, payload: dict[str, Any] | None = None) -> Any:
+        if not self._use_apps_script:
+            raise SheetsSyncError("Modo Apps Script nao esta habilitado.")
+        if not self._apps_script_url:
+            raise SheetsSyncError("Configurar GOOGLE_APPS_SCRIPT_WEBHOOK_URL para usar Apps Script.")
+
+        body: dict[str, Any] = {
+            "action": action,
+            "spreadsheet_id": str(self.settings.google_spreadsheet_id or "").strip(),
+        }
+        if payload:
+            body.update(payload)
+        if self._apps_script_token:
+            body["token"] = self._apps_script_token
+
+        try:
+            response = httpx.post(
+                self._apps_script_url,
+                json=body,
+                timeout=float(self.settings.google_apps_script_timeout_seconds or 20.0),
+                headers={"Content-Type": "application/json"},
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPError as exc:
+            raise SheetsSyncError(
+                f"Falha de conexao com Apps Script ({action}): {exc}",
+            ) from exc
+        except ValueError as exc:
+            raise SheetsSyncError(
+                f"Resposta invalida do Apps Script ({action}).",
+            ) from exc
+
+        if isinstance(data, dict) and data.get("ok") is False:
+            message = str(data.get("error") or "erro_apps_script")
+            raise SheetsSyncError(f"Apps Script retornou erro em '{action}': {message}")
+
+        if isinstance(data, dict) and "result" in data:
+            return data.get("result")
+        return data
 
     @staticmethod
     def _is_quota_error(exc: APIError) -> bool:
@@ -136,6 +191,15 @@ class GoogleSheetsClient:
             self._raise_sheets_error(exc, f"worksheet:{title}")
 
     def ensure_headers(self, sheet_name: str, required_headers: list[str]) -> list[str]:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call(
+                "ensure_headers",
+                {"sheet_name": sheet_name, "required_headers": required_headers},
+            )
+            if isinstance(result, list):
+                return [str(item) for item in result]
+            raise SheetsSyncError("Apps Script retornou headers invalidos em 'ensure_headers'.")
+
         try:
             ws = self._worksheet(sheet_name)
             existing_headers = ws.row_values(1)
@@ -150,6 +214,16 @@ class GoogleSheetsClient:
             self._raise_sheets_error(exc, f"ensure_headers:{sheet_name}")
 
     def read_records(self, sheet_name: str) -> list[dict[str, str]]:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call("read_records", {"sheet_name": sheet_name})
+            if isinstance(result, list):
+                return [
+                    {str(key): str(value or "") for key, value in row.items()}
+                    for row in result
+                    if isinstance(row, dict)
+                ]
+            raise SheetsSyncError("Apps Script retornou payload invalido em 'read_records'.")
+
         try:
             ws = self._worksheet(sheet_name)
             values = ws.get_all_values()
@@ -168,6 +242,31 @@ class GoogleSheetsClient:
             self._raise_sheets_error(exc, f"read_records:{sheet_name}")
 
     def read_records_with_row_number(self, sheet_name: str) -> list[dict[str, str | int]]:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call(
+                "read_records_with_row_number",
+                {"sheet_name": sheet_name},
+            )
+            if isinstance(result, list):
+                rows: list[dict[str, str | int]] = []
+                for row in result:
+                    if not isinstance(row, dict):
+                        continue
+                    normalized: dict[str, str | int] = {}
+                    for key, value in row.items():
+                        if str(key) == "_row_number":
+                            try:
+                                normalized["_row_number"] = int(value)  # type: ignore[arg-type]
+                            except (TypeError, ValueError):
+                                normalized["_row_number"] = 0
+                        else:
+                            normalized[str(key)] = str(value or "")
+                    rows.append(normalized)
+                return rows
+            raise SheetsSyncError(
+                "Apps Script retornou payload invalido em 'read_records_with_row_number'.",
+            )
+
         try:
             ws = self._worksheet(sheet_name)
             values = ws.get_all_values()
@@ -192,6 +291,18 @@ class GoogleSheetsClient:
         records: list[dict[str, Any]],
         key_fields: list[str],
     ) -> dict[str, int]:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call(
+                "upsert_records",
+                {"sheet_name": sheet_name, "records": records, "key_fields": key_fields},
+            )
+            if isinstance(result, dict):
+                return {
+                    "inserted": int(result.get("inserted", 0) or 0),
+                    "updated": int(result.get("updated", 0) or 0),
+                }
+            raise SheetsSyncError("Apps Script retornou payload invalido em 'upsert_records'.")
+
         try:
             ws = self._worksheet(sheet_name)
             if not records:
@@ -255,6 +366,18 @@ class GoogleSheetsClient:
         records: list[dict[str, Any]],
         headers: list[str] | None = None,
     ) -> int:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call(
+                "overwrite_records",
+                {"sheet_name": sheet_name, "records": records, "headers": headers or []},
+            )
+            if isinstance(result, (int, float, str)):
+                try:
+                    return int(result)
+                except (TypeError, ValueError):
+                    pass
+            raise SheetsSyncError("Apps Script retornou payload invalido em 'overwrite_records'.")
+
         try:
             ws = self._worksheet(sheet_name)
             ws.clear()
@@ -279,6 +402,25 @@ class GoogleSheetsClient:
         subheader: list[str],
         rows: list[list[Any]],
     ) -> int:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call(
+                "overwrite_table_with_subheader",
+                {
+                    "sheet_name": sheet_name,
+                    "headers": headers,
+                    "subheader": subheader,
+                    "rows": rows,
+                },
+            )
+            if isinstance(result, (int, float, str)):
+                try:
+                    return int(result)
+                except (TypeError, ValueError):
+                    pass
+            raise SheetsSyncError(
+                "Apps Script retornou payload invalido em 'overwrite_table_with_subheader'.",
+            )
+
         try:
             ws = self._worksheet(sheet_name)
             ws.clear()
@@ -298,6 +440,13 @@ class GoogleSheetsClient:
     def clear_rows(self, sheet_name: str, row_numbers: list[int]) -> None:
         if not row_numbers:
             return
+        if getattr(self, "_use_apps_script", False):
+            self._apps_call(
+                "clear_rows",
+                {"sheet_name": sheet_name, "row_numbers": row_numbers},
+            )
+            return
+
         try:
             ws = self._worksheet(sheet_name)
             headers = ws.row_values(1)
@@ -326,6 +475,18 @@ class GoogleSheetsClient:
     ) -> None:
         if not updates:
             return
+        if getattr(self, "_use_apps_script", False):
+            self._apps_call(
+                "update_sync_status_rows",
+                {
+                    "sheet_name": sheet_name,
+                    "updates": updates,
+                    "status_header": status_header,
+                    "error_header": error_header,
+                },
+            )
+            return
+
         try:
             headers = self.ensure_headers(sheet_name, [status_header, error_header])
             status_col = headers.index(status_header) + 1
@@ -351,6 +512,13 @@ class GoogleSheetsClient:
             self._raise_sheets_error(exc, f"update_sync_status_rows:{sheet_name}")
 
     def append_event(self, sheet_name: str, payload: dict[str, Any]) -> None:
+        if getattr(self, "_use_apps_script", False):
+            self._apps_call(
+                "append_event",
+                {"sheet_name": sheet_name, "payload": payload},
+            )
+            return
+
         try:
             ws = self._worksheet(sheet_name)
             existing_headers = ws.row_values(1)
@@ -370,6 +538,13 @@ class GoogleSheetsClient:
             self._raise_sheets_error(exc, f"append_event:{sheet_name}")
 
     def apply_alunos_layout(self, sheet_name: str, header_count: int) -> None:
+        if getattr(self, "_use_apps_script", False):
+            self._apps_call(
+                "apply_alunos_layout",
+                {"sheet_name": sheet_name, "header_count": int(header_count)},
+            )
+            return
+
         try:
             ws = self._worksheet(sheet_name)
             sheet_id = ws.id
@@ -512,6 +687,14 @@ class GoogleSheetsClient:
             self._raise_sheets_error(exc, f"apply_alunos_layout:{sheet_name}")
 
     def ping(self) -> bool:
+        if getattr(self, "_use_apps_script", False):
+            result = self._apps_call("ping")
+            if isinstance(result, bool):
+                return result
+            if isinstance(result, dict):
+                return bool(result.get("ok", True))
+            return bool(result)
+
         try:
             _ = self._spreadsheet.title
             return True

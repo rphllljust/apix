@@ -88,6 +88,27 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GOOGLE_OAUTH_REFRESH_TOKEN"),
     )
+    google_apps_script_webhook_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_APPS_SCRIPT_WEBHOOK_URL",
+            "APPS_SCRIPT_WEBHOOK_URL",
+        ),
+    )
+    google_apps_script_webhook_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_APPS_SCRIPT_WEBHOOK_TOKEN",
+            "APPS_SCRIPT_WEBHOOK_TOKEN",
+        ),
+    )
+    google_apps_script_timeout_seconds: float = Field(
+        default=20.0,
+        validation_alias=AliasChoices(
+            "GOOGLE_APPS_SCRIPT_TIMEOUT_SECONDS",
+            "APPS_SCRIPT_TIMEOUT_SECONDS",
+        ),
+    )
     google_students_sheet: str = "students"
     google_courses_sheet: str = "courses"
     google_categories_sheet: str = "categories"
