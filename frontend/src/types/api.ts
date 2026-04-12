@@ -1,12 +1,16 @@
 export interface HealthResponse {
   moodle: {
-    site_name?: string
-    username?: string
-    moodle_release?: string
+    status: 'online' | 'offline' | 'auth_error'
+    username: string
+    fullname: string
+    userid: number
+    site: string
+    version: string
   }
-  sheets_ok: boolean
-  last_moodle_to_sheets: string | null
-  last_sheets_to_moodle: string | null
+  sheets: {
+    status: 'online' | 'offline'
+    last_check: string
+  }
 }
 
 export interface CourseItem {
@@ -41,3 +45,73 @@ export interface SyncSummaryResponse {
   extra: Record<string, unknown>
 }
 
+export interface MoodleTokenConfigResponse {
+  ok: boolean
+  message: string
+  moodle: {
+    username: string
+    fullname: string
+    userid: number
+    site: string
+    version: string
+  }
+  runtime_status: 'online' | 'degraded'
+}
+
+export interface GoogleSheetsOAuthStartResponse {
+  auth_url: string
+  expires_in_seconds: number
+  redirect_uri: string
+}
+
+export interface GoogleSheetsConfigResponse {
+  oauth: {
+    configured: boolean
+    client_id_masked: string
+    redirect_uri: string
+    refresh_token_configured: boolean
+  }
+  spreadsheet: {
+    id: string
+    url: string
+  }
+}
+
+export interface GoogleSheetsConfigPayload {
+  client_id: string
+  client_secret: string
+  redirect_uri: string
+  spreadsheet: string
+}
+
+export interface GoogleSheetsConfigSaveResponse {
+  ok: boolean
+  message: string
+  oauth: {
+    configured: boolean
+    redirect_uri: string
+    refresh_token_configured: boolean
+  }
+  spreadsheet: {
+    id: string
+    url: string
+  }
+  sheets_runtime_status: 'online' | 'offline'
+}
+
+export interface DriveToMoodleSyncResponse {
+  direction: string
+  started_at: string
+  finished_at: string
+  duration_seconds: number
+  processed_counts: {
+    uploaded: number
+    failed: number
+  }
+  warnings: string[]
+  extra: {
+    uploaded: string[]
+    failed: string[]
+    triggered_by: string
+  }
+}

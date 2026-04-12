@@ -36,11 +36,17 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TRUST_PROXY_HEADERS"),
     )
 
-    moodle_base_url: str
+    moodle_base_url: str = Field(
+        validation_alias=AliasChoices("MOODLE_BASE_URL", "MOODLE_URL"),
+    )
     moodle_token: str
+    moodle_ws_format: str = Field(
+        default="json",
+        validation_alias=AliasChoices("MOODLE_WSFORMAT", "MOODLE_WS_FORMAT"),
+    )
     moodle_rest_endpoint: str = "/webservice/rest/server.php"
     moodle_timeout_seconds: float = Field(
-        default=30.0,
+        default=10.0,
         validation_alias=AliasChoices("MOODLE_TIMEOUT_SECONDS", "MOODLE_TIMEOUT"),
     )
     moodle_max_retries: int = Field(
@@ -65,6 +71,22 @@ class Settings(BaseSettings):
     )
     google_spreadsheet_id: str = Field(
         validation_alias=AliasChoices("GOOGLE_SPREADSHEET_ID", "SPREADSHEET_ID"),
+    )
+    google_oauth_client_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_OAUTH_CLIENT_ID"),
+    )
+    google_oauth_client_secret: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_OAUTH_CLIENT_SECRET"),
+    )
+    google_oauth_redirect_uri: str = Field(
+        default="http://localhost:8000/api/v1/google-sheets/oauth/callback",
+        validation_alias=AliasChoices("GOOGLE_OAUTH_REDIRECT_URI"),
+    )
+    google_oauth_refresh_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_OAUTH_REFRESH_TOKEN"),
     )
     google_students_sheet: str = "students"
     google_courses_sheet: str = "courses"
@@ -153,6 +175,14 @@ class Settings(BaseSettings):
         if not value.startswith("/"):
             return f"/{value}"
         return value
+
+    @field_validator("moodle_ws_format", mode="before")
+    @classmethod
+    def normalize_moodle_ws_format(cls, value: Any) -> str:
+        raw = str(value or "json").strip().lower()
+        if not raw:
+            return "json"
+        return raw
 
     @field_validator("moodle_default_course_ids", mode="before")
     @classmethod

@@ -1,6 +1,18 @@
-import { zodResolver } from '@hookform/resolvers/zod'
+﻿import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Activity, BookOpenCheck, RefreshCw, Search, Server, ShieldCheck } from 'lucide-react'
+import {
+  Activity,
+  BookOpenCheck,
+  Cloud,
+  Eye,
+  EyeOff,
+  KeyRound,
+  RefreshCw,
+  Search,
+  Server,
+  ShieldCheck,
+  X,
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
@@ -12,13 +24,18 @@ import { Select } from '@/components/ui/select'
 import { SHEETS_ENROLLMENT_COLUMNS } from '@/constants/sheets-columns'
 import { useDebounce } from '@/hooks/use-debounce'
 import {
+  configureGoogleSheets,
+  configureMoodleToken,
+  fetchGoogleSheetsConfig,
   fetchCourses,
   fetchCoursesGraphQL,
   fetchHealth,
   fetchSyncLogs,
   fetchSyncLogsGraphQL,
+  startGoogleSheetsOAuth,
   toApiError,
   triggerCourseSync,
+  triggerDriveToMoodleSync,
 } from '@/lib/api'
 import { useUiStore } from '@/store/use-ui-store'
 import type { CourseItem, SyncLogItem } from '@/types/api'
@@ -46,6 +63,34 @@ function mapStatusTone(
   return 'neutral'
 }
 
+function mapMoodleStatusTone(
+  status: 'online' | 'offline' | 'auth_error' | undefined,
+): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (status === 'online') {
+    return 'success'
+  }
+  if (status === 'auth_error') {
+    return 'warning'
+  }
+  if (status === 'offline') {
+    return 'danger'
+  }
+  return 'neutral'
+}
+
+function moodleStatusLabel(status: 'online' | 'offline' | 'auth_error' | undefined): string {
+  if (status === 'online') {
+    return 'Online'
+  }
+  if (status === 'auth_error') {
+    return 'Erro de Token'
+  }
+  if (status === 'offline') {
+    return 'Offline'
+  }
+  return 'Pendente'
+}
+
 function sortCourses(courses: CourseItem[] | undefined): CourseItem[] {
   return [...(courses ?? [])].sort((a, b) =>
     (a.fullname ?? a.shortname ?? '').localeCompare(b.fullname ?? b.shortname ?? ''),
@@ -53,6 +98,9 @@ function sortCourses(courses: CourseItem[] | undefined): CourseItem[] {
 }
 
 export default function DashboardPage(): ReactElement {
+  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+  const defaultGoogleRedirectUri = `${apiBaseUrl.replace(/\/$/, '')}/api/v1/google-sheets/oauth/callback`
+
   const queryClient = useQueryClient()
   const selectedCourseId = useUiStore((s) => s.selectedCourseId)
   const setSelectedCourseId = useUiStore((s) => s.setSelectedCourseId)
@@ -64,6 +112,19 @@ export default function DashboardPage(): ReactElement {
   const [courseSearchText, setCourseSearchText] = useState<string>('')
   const [logSearchText, setLogSearchText] = useState<string>('')
   const [visibleLogsCount, setVisibleLogsCount] = useState<number>(10)
+  const [isTokenModalOpen, setIsTokenModalOpen] = useState<boolean>(false)
+  const [tokenInput, setTokenInput] = useState<string>('')
+  const [tokenVisible, setTokenVisible] = useState<boolean>(false)
+  const [isGoogleConfigModalOpen, setIsGoogleConfigModalOpen] = useState<boolean>(false)
+  const [googleClientId, setGoogleClientId] = useState<string>('')
+  const [googleClientSecret, setGoogleClientSecret] = useState<string>('')
+  const [googleClientSecretVisible, setGoogleClientSecretVisible] = useState<boolean>(false)
+  const [googleRedirectUri, setGoogleRedirectUri] = useState<string>(defaultGoogleRedirectUri)
+  const [googleSpreadsheetInput, setGoogleSpreadsheetInput] = useState<string>('')
+  const [isDriveModalOpen, setIsDriveModalOpen] = useState<boolean>(false)
+  const [driveFolderId, setDriveFolderId] = useState<string>('')
+  const [driveFileIds, setDriveFileIds] = useState<string>('')
+  const [driveSectionNumber, setDriveSectionNumber] = useState<number>(0)
   const loadMoreRef = useRef<HTMLDivElement | null>(null)
 
   const debouncedCourseSearch = useDebounce(courseSearchText, 300)
@@ -102,10 +163,67 @@ export default function DashboardPage(): ReactElement {
     retry: 2,
   })
 
+  const googleSheetsConfigQuery = useQuery({
+    queryKey: ['google-sheets-config'],
+    queryFn: fetchGoogleSheetsConfig,
+    staleTime: 5 * 60 * 1000,
+    retry: 1,
+  })
+
   const syncMutation = useMutation({
     mutationFn: ({ courseId, mode }: SyncFormOutput) => triggerCourseSync(courseId, mode),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['sync-logs'] })
+      void queryClient.invalidateQueries({ queryKey: ['health'] })
+    },
+  })
+
+  const tokenMutation = useMutation({
+    mutationFn: (token: string) => configureMoodleToken(token),
+    onSuccess: () => {
+      setTokenInput('')
+      setTokenVisible(false)
+      setIsTokenModalOpen(false)
+      void queryClient.invalidateQueries({ queryKey: ['health'] })
+      void queryClient.invalidateQueries({ queryKey: ['courses'] })
+    },
+  })
+
+  const sheetsOAuthMutation = useMutation({
+    mutationFn: () => startGoogleSheetsOAuth(),
+    onSuccess: (payload) => {
+      window.open(payload.auth_url, '_blank', 'noopener,noreferrer')
+    },
+    onError: (error) => {
+      const message = toApiError(error).message.toLowerCase()
+      if (message.includes('google_oauth_client_id') || message.includes('google_oauth_client_secret')) {
+        setIsGoogleConfigModalOpen(true)
+      }
+    },
+  })
+
+  const driveToMoodleMutation = useMutation({
+    mutationFn: (payload: { folder_id?: string; file_ids?: string[]; section_number?: number }) =>
+      selectedCourseId ? triggerDriveToMoodleSync(selectedCourseId, payload) : Promise.reject(new Error('Nenhum curso selecionado')),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['sync-logs'] })
+      void queryClient.invalidateQueries({ queryKey: ['health'] })
+    },
+  })
+
+  const googleConfigMutation = useMutation({
+    mutationFn: () =>
+      configureGoogleSheets({
+        client_id: googleClientId.trim(),
+        client_secret: googleClientSecret.trim(),
+        redirect_uri: googleRedirectUri.trim(),
+        spreadsheet: googleSpreadsheetInput.trim(),
+      }),
+    onSuccess: () => {
+      setGoogleClientSecret('')
+      setGoogleClientSecretVisible(false)
+      setIsGoogleConfigModalOpen(false)
+      void queryClient.invalidateQueries({ queryKey: ['google-sheets-config'] })
       void queryClient.invalidateQueries({ queryKey: ['health'] })
     },
   })
@@ -166,11 +284,29 @@ export default function DashboardPage(): ReactElement {
     return <Badge tone={mapStatusTone(item.status)}>{item.status.toUpperCase()}</Badge>
   }, [logsQuery.data])
 
+  const moodleStatus = healthQuery.data?.moodle?.status
+  const sheetsStatus = healthQuery.data?.sheets?.status
+  const isMoodleAuthError = moodleStatus === 'auth_error'
+  const googleOAuthConfigured = googleSheetsConfigQuery.data?.oauth?.configured ?? false
+  const googleRefreshConfigured =
+    googleSheetsConfigQuery.data?.oauth?.refresh_token_configured ?? false
+
   const onSubmit = handleSubmit((values: SyncFormOutput) => {
     setSelectedCourseId(values.courseId)
     setSyncMode(values.mode)
     syncMutation.mutate(values)
   })
+
+  const openGoogleConfigModal = () => {
+    const currentConfig = googleSheetsConfigQuery.data
+    setGoogleClientId('')
+    setGoogleClientSecret('')
+    setGoogleClientSecretVisible(false)
+    setGoogleRedirectUri(currentConfig?.oauth.redirect_uri || defaultGoogleRedirectUri)
+    setGoogleSpreadsheetInput(currentConfig?.spreadsheet.url || currentConfig?.spreadsheet.id || '')
+    setIsGoogleConfigModalOpen(true)
+    void googleSheetsConfigQuery.refetch()
+  }
 
   return (
     <div className="relative min-h-screen overflow-x-hidden bg-bg text-ink">
@@ -181,7 +317,7 @@ export default function DashboardPage(): ReactElement {
             Middleware AVA IDEP
           </p>
           <h1 className="text-3xl font-bold leading-tight md:text-5xl">
-            Painel de Integracao Moodle ↔ Google Sheets
+            Painel de Integracao Moodle &lt;-&gt; Google Sheets
           </h1>
           <p className="max-w-3xl text-sm text-slate-700 md:text-base">
             Operacao direta de sync e monitoramento da API FastAPI.
@@ -198,7 +334,7 @@ export default function DashboardPage(): ReactElement {
                 </CardTitle>
                 <CardDescription>
                   Base URL:{' '}
-                  <strong>{import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'}</strong>
+                  <strong>{apiBaseUrl}</strong>
                 </CardDescription>
               </div>
               <div className="flex items-center gap-2">
@@ -216,6 +352,7 @@ export default function DashboardPage(): ReactElement {
                     void healthQuery.refetch()
                     void logsQuery.refetch()
                     void coursesQuery.refetch()
+                    void googleSheetsConfigQuery.refetch()
                   }}
                   disabled={healthQuery.isFetching}
                 >
@@ -227,22 +364,90 @@ export default function DashboardPage(): ReactElement {
 
             <div className="mt-4 grid gap-3 sm:grid-cols-2">
               <div className="rounded-md border border-line bg-white p-3">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Moodle</p>
-                <p className="mt-1 text-sm font-semibold">{healthQuery.data?.moodle?.site_name ?? '—'}</p>
-                <p className="text-xs text-slate-500">
-                  Usuario tecnico: {healthQuery.data?.moodle?.username ?? '—'}
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Moodle</p>
+                  <Badge tone={mapMoodleStatusTone(moodleStatus)}>
+                    {moodleStatusLabel(moodleStatus)}
+                  </Badge>
+                </div>
+                <p className="mt-1 text-sm font-semibold">
+                  {healthQuery.data?.moodle?.fullname || 'Usuario tecnico nao identificado'}
                 </p>
+                <p className="text-xs text-slate-500">
+                  Usuario tecnico: {healthQuery.data?.moodle?.username || '—'}
+                </p>
+                <p className="text-xs text-slate-500">{healthQuery.data?.moodle?.site || '—'}</p>
+                {isMoodleAuthError && (
+                  <Button
+                    className="mt-3 w-full"
+                    variant="accent"
+                    type="button"
+                    onClick={() => setIsTokenModalOpen(true)}
+                  >
+                    <KeyRound className="h-4 w-4" />
+                    Configurar Token
+                  </Button>
+                )}
               </div>
               <div className="rounded-md border border-line bg-white p-3">
-                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-                  Google Sheets
-                </p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Google Sheets
+                  </p>
+                  <Badge tone={sheetsStatus === 'online' ? 'success' : 'danger'}>
+                    {sheetsStatus === 'online' ? 'Online' : 'Offline'}
+                  </Badge>
+                </div>
                 <p className="mt-1 text-sm font-semibold">
-                  {healthQuery.data?.sheets_ok ? 'Conectado' : 'Indisponivel'}
+                  {healthQuery.data?.sheets?.status === 'online' ? 'Conectado' : 'Indisponivel'}
                 </p>
                 <p className="text-xs text-slate-500">
-                  Ultimo status: {healthQuery.isSuccess ? 'OK' : 'Pendente'}
+                  Ultima verificacao: {' '}
+                  {healthQuery.data?.sheets?.last_check
+                    ? new Date(healthQuery.data.sheets.last_check).toLocaleString('pt-BR')
+                    : 'Pendente'}
                 </p>
+                <p className="text-xs text-slate-500">
+                  Planilha: {googleSheetsConfigQuery.data?.spreadsheet.id || 'Nao configurada'}
+                </p>
+                <p className="text-xs text-slate-500">
+                  OAuth: {googleOAuthConfigured ? 'Configurado' : 'Pendente'} | Refresh token:{' '}
+                  {googleRefreshConfigured ? 'OK' : 'Nao autorizado'}
+                </p>
+                <div className="mt-3 grid gap-2">
+                  <Button
+                    className="w-full"
+                    variant="ghost"
+                    type="button"
+                    onClick={openGoogleConfigModal}
+                    disabled={googleConfigMutation.isPending}
+                  >
+                    <KeyRound className="h-4 w-4" />
+                    Configurar Google
+                  </Button>
+                  {sheetsStatus !== 'online' && (
+                    <Button
+                      className="w-full"
+                      variant="accent"
+                      type="button"
+                      onClick={() => sheetsOAuthMutation.mutate()}
+                      disabled={sheetsOAuthMutation.isPending}
+                    >
+                      <KeyRound className="h-4 w-4" />
+                      {sheetsOAuthMutation.isPending ? 'Abrindo login...' : 'Login Google Sheets'}
+                    </Button>
+                  )}
+                </div>
+                {googleConfigMutation.isSuccess && (
+                  <p className="mt-2 text-xs font-semibold text-emerald-700">
+                    {googleConfigMutation.data.message}
+                  </p>
+                )}
+                {sheetsOAuthMutation.isError && (
+                  <p className="mt-2 text-xs font-semibold text-red-700">
+                    {toApiError(sheetsOAuthMutation.error).message}
+                  </p>
+                )}
               </div>
             </div>
           </Card>
@@ -427,6 +632,80 @@ export default function DashboardPage(): ReactElement {
           </Card>
         </section>
 
+        <section className="grid gap-4">
+          <Card>
+            <CardTitle className="flex items-center gap-2">
+              <Cloud className="h-5 w-5 text-blue-500" />
+              Google Drive → Moodle
+            </CardTitle>
+            <CardDescription className="mt-2">
+              Envie arquivos do Google Drive como recursos de curso no Moodle.
+            </CardDescription>
+
+            <div className="mt-4 space-y-3">
+              <div className="space-y-1">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  Selecione o curso de destino
+                </label>
+                <Select
+                  value={selectedCourseId ?? ''}
+                  onChange={(event) => setSelectedCourseId(Number(event.target.value) || null)}
+                >
+                  <option value="">Selecione um curso...</option>
+                  {sortCourses(coursesQuery.data).map((course) => (
+                    <option key={course.id} value={course.id}>
+                      {course.id} - {course.fullname ?? course.shortname ?? 'Curso sem nome'}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+
+              <Button
+                className="w-full"
+                variant="accent"
+                type="button"
+                onClick={() => setIsDriveModalOpen(true)}
+                disabled={!selectedCourseId}
+              >
+                <Cloud className="h-4 w-4" />
+                Selecionar arquivos do Drive
+              </Button>
+
+              {driveToMoodleMutation.isError && (
+                <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  {toApiError(driveToMoodleMutation.error).message}
+                </div>
+              )}
+
+              {driveToMoodleMutation.isSuccess && (
+                <div className="space-y-2 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">
+                  <p className="font-semibold">✓ Sincronizacao concluida em {driveToMoodleMutation.data.duration_seconds.toFixed(2)}s</p>
+                  {driveToMoodleMutation.data.extra.uploaded.length > 0 && (
+                    <div>
+                      <p className="font-semibold">Enviados com sucesso ({driveToMoodleMutation.data.extra.uploaded.length}):</p>
+                      <ul className="ml-4 list-disc text-xs">
+                        {driveToMoodleMutation.data.extra.uploaded.map((file) => (
+                          <li key={file}>{file}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {driveToMoodleMutation.data.extra.failed.length > 0 && (
+                    <div>
+                      <p className="font-semibold text-red-700">Falharam ({driveToMoodleMutation.data.extra.failed.length}):</p>
+                      <ul className="ml-4 list-disc text-xs text-red-700">
+                        {driveToMoodleMutation.data.extra.failed.map((file) => (
+                          <li key={file}>{file}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </Card>
+        </section>
+
         <footer className="grid gap-3 rounded-lg border border-line bg-panel px-4 py-3 text-xs text-slate-600 md:grid-cols-3">
           <div className="font-semibold">React + Vite + TypeScript</div>
           <div>Axios + TanStack Query + Zustand</div>
@@ -449,6 +728,317 @@ export default function DashboardPage(): ReactElement {
             ))}
           </div>
         </Card>
+
+        {isGoogleConfigModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
+            <div className="w-full max-w-xl rounded-lg border border-line bg-panel p-5 shadow-2xl">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-ink">Configurar Google Sheets OAuth</h2>
+                  <p className="text-sm text-slate-600">
+                    Salve as credenciais OAuth e o link da planilha para liberar o login Google.
+                  </p>
+                </div>
+                <Button
+                  aria-label="Fechar configuracao do Google Sheets"
+                  className="h-9 w-9 rounded-full p-0"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    if (!googleConfigMutation.isPending) {
+                      setIsGoogleConfigModalOpen(false)
+                    }
+                  }}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+
+              {googleSheetsConfigQuery.data?.oauth.client_id_masked && (
+                <p className="mt-3 text-xs text-slate-600">
+                  Client ID atual (mascarado): {googleSheetsConfigQuery.data.oauth.client_id_masked}
+                </p>
+              )}
+
+              <div className="mt-4 space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  Google OAuth Client ID
+                </label>
+                <Input
+                  autoFocus
+                  placeholder="1234567890-abc.apps.googleusercontent.com"
+                  value={googleClientId}
+                  onChange={(event) => setGoogleClientId(event.target.value)}
+                />
+              </div>
+
+              <div className="mt-3 space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  Google OAuth Client Secret
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    placeholder="Cole o client secret"
+                    type={googleClientSecretVisible ? 'text' : 'password'}
+                    value={googleClientSecret}
+                    onChange={(event) => setGoogleClientSecret(event.target.value)}
+                  />
+                  <Button
+                    aria-label={googleClientSecretVisible ? 'Ocultar segredo' : 'Mostrar segredo'}
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setGoogleClientSecretVisible((prev) => !prev)}
+                  >
+                    {googleClientSecretVisible ? (
+                      <EyeOff className="h-4 w-4" />
+                    ) : (
+                      <Eye className="h-4 w-4" />
+                    )}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="mt-3 space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  Redirect URI
+                </label>
+                <Input
+                  placeholder="http://localhost:8000/api/v1/google-sheets/oauth/callback"
+                  value={googleRedirectUri}
+                  onChange={(event) => setGoogleRedirectUri(event.target.value)}
+                />
+              </div>
+
+              <div className="mt-3 space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  URL da planilha Google
+                </label>
+                <Input
+                  placeholder="https://docs.google.com/spreadsheets/d/.../edit"
+                  value={googleSpreadsheetInput}
+                  onChange={(event) => setGoogleSpreadsheetInput(event.target.value)}
+                />
+              </div>
+
+              {googleConfigMutation.isError && (
+                <div className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  {toApiError(googleConfigMutation.error).message}
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setIsGoogleConfigModalOpen(false)}
+                  disabled={googleConfigMutation.isPending}
+                >
+                  Cancelar
+                </Button>
+                <Button
+                  type="button"
+                  disabled={
+                    googleConfigMutation.isPending ||
+                    googleClientId.trim().length < 20 ||
+                    googleClientSecret.trim().length < 10 ||
+                    googleRedirectUri.trim().length < 10 ||
+                    googleSpreadsheetInput.trim().length < 10
+                  }
+                  onClick={() => googleConfigMutation.mutate()}
+                >
+                  {googleConfigMutation.isPending ? 'Salvando...' : 'Salvar Configuracao'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isTokenModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
+            <div className="w-full max-w-lg rounded-lg border border-line bg-panel p-5 shadow-2xl">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-ink">Configurar Token Moodle</h2>
+                  <p className="text-sm text-slate-600">
+                    Informe a chave de Web Service do administrador e valide a conexao.
+                  </p>
+                </div>
+                <Button
+                  aria-label="Fechar configuracao de token"
+                  className="h-9 w-9 rounded-full p-0"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    if (!tokenMutation.isPending) {
+                      setIsTokenModalOpen(false)
+                    }
+                  }}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+
+              <div className="mt-4 space-y-2">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                  Token Moodle
+                </label>
+                <div className="flex gap-2">
+                  <Input
+                    autoFocus
+                    placeholder="Cole aqui o token de Web Service"
+                    type={tokenVisible ? 'text' : 'password'}
+                    value={tokenInput}
+                    onChange={(event) => setTokenInput(event.target.value)}
+                  />
+                  <Button
+                    aria-label={tokenVisible ? 'Ocultar token' : 'Mostrar token'}
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setTokenVisible((prev) => !prev)}
+                  >
+                    {tokenVisible ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </Button>
+                </div>
+              </div>
+
+              {tokenMutation.isError && (
+                <div className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  {toApiError(tokenMutation.error).message}
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setIsTokenModalOpen(false)}
+                  disabled={tokenMutation.isPending}
+                >
+                  Cancelar
+                </Button>
+                <Button
+                  type="button"
+                  disabled={tokenMutation.isPending || tokenInput.trim().length < 8}
+                  onClick={() => tokenMutation.mutate(tokenInput.trim())}
+                >
+                  {tokenMutation.isPending ? 'Testando...' : 'Testar Conexao'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isDriveModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 px-4">
+            <div className="w-full max-w-lg rounded-lg border border-line bg-panel p-5 shadow-2xl">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-lg font-bold text-ink">Google Drive → Moodle</h2>
+                  <p className="text-sm text-slate-600">
+                    Cole o ID da pasta ou IDs dos arquivos do Google Drive.
+                  </p>
+                </div>
+                <Button
+                  aria-label="Fechar selecao do Google Drive"
+                  className="h-9 w-9 rounded-full p-0"
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    if (!driveToMoodleMutation.isPending) {
+                      setIsDriveModalOpen(false)
+                    }
+                  }}
+                >
+                  <X className="h-4 w-4" />
+                </Button>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                    ID da pasta do Drive (OU file IDs abaixo)
+                  </label>
+                  <Input
+                    placeholder="Ex: 1A2B3C4D5E6F7G8H9I0J..."
+                    value={driveFolderId}
+                    onChange={(event) => setDriveFolderId(event.target.value)}
+                  />
+                  <p className="text-xs text-slate-500">
+                    Encontre o ID na URL: docs.google.com/drive/folders/<span className="font-mono">ID_AQUI</span>
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                    IDs dos arquivos (separados por virgula)
+                  </label>
+                  <Input
+                    placeholder="Ex: file1,file2,file3"
+                    value={driveFileIds}
+                    onChange={(event) => setDriveFileIds(event.target.value)}
+                  />
+                  <p className="text-xs text-slate-500">
+                    Alternativa ao ID da pasta. Encontre em: drive.google.com/file/d/<span className="font-mono">ID_AQUI</span>/view
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                    Número da seção do curso
+                  </label>
+                  <Input
+                    type="number"
+                    min="0"
+                    placeholder="0"
+                    value={driveSectionNumber}
+                    onChange={(event) => setDriveSectionNumber(Number(event.target.value) || 0)}
+                  />
+                  <p className="text-xs text-slate-500">
+                    Seção do Moodle onde adicionar os recursos (0 = seção geral)
+                  </p>
+                </div>
+              </div>
+
+              {driveToMoodleMutation.isError && (
+                <div className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                  {toApiError(driveToMoodleMutation.error).message}
+                </div>
+              )}
+
+              <div className="mt-4 flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => setIsDriveModalOpen(false)}
+                  disabled={driveToMoodleMutation.isPending}
+                >
+                  Cancelar
+                </Button>
+                <Button
+                  type="button"
+                  disabled={
+                    driveToMoodleMutation.isPending ||
+                    (!driveFolderId.trim() && !driveFileIds.trim())
+                  }
+                  onClick={() => {
+                    driveToMoodleMutation.mutate({
+                      folder_id: driveFolderId.trim() || undefined,
+                      file_ids: driveFileIds
+                        .trim()
+                        .split(',')
+                        .map((id) => id.trim())
+                        .filter((id) => id.length > 0) || undefined,
+                      section_number: driveSectionNumber,
+                    })
+                    setIsDriveModalOpen(false)
+                  }}
+                >
+                  {driveToMoodleMutation.isPending ? 'Enviando...' : 'Enviar para Moodle'}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   )

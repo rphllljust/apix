@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import re
 from datetime import UTC, date, datetime
 from typing import Any
@@ -11,6 +12,7 @@ from uuid import uuid4
 from loguru import logger
 
 from app.sheets.client import GoogleSheetsClient
+from app.sheets.drive import GoogleDriveClient
 from app.sheets.formatters import (
     to_course_detailed_grades_sheet_name,
     to_course_students_sheet_name,
@@ -19,6 +21,7 @@ from app.sheets.templates import ALUNOS_BASE_HEADERS
 from app.models.schemas import (
     AlunoSheet,
     BidirectionalRequest,
+    DriveToMoodleRequest,
     MoodleToSheetsRequest,
     SheetsToMoodleRequest,
     SyncDirection,
@@ -1070,6 +1073,120 @@ class SyncEngine:
     def get_sync_log(self, sync_id: str) -> dict[str, Any] | None:
         return self.state.get_entity_sync_log(sync_id)
 
+    async def sync_drive_to_moodle(
+        self,
+        course_id: int,
+        request: DriveToMoodleRequest,
+    ) -> SyncRunSummary:
+        """
+        Sincroniza arquivos do Google Drive para o Moodle como recursos de curso.
+
+        Args:
+            course_id: ID do curso no Moodle
+            request: Configuração com folder_id ou file_ids, seção do curso, etc.
+
+        Returns:
+            SyncRunSummary com lista de arquivos enviados e falhados
+        """
+        started_at = datetime.now(UTC)
+        warnings: list[str] = []
+        uploaded: list[str] = []
+        failed: list[str] = []
+
+        # Inicializa cliente Drive
+        drive = await asyncio.to_thread(GoogleDriveClient, self.sheets.settings)
+
+        # Resolve lista de arquivos
+        files: list[dict[str, Any]] = []
+        if request.file_ids:
+            files = [
+                {"id": fid, "name": fid, "mimeType": "application/octet-stream"}
+                for fid in request.file_ids
+            ]
+            logger.info("Using {} file IDs from request", len(files))
+        elif request.folder_id:
+            try:
+                files = await asyncio.to_thread(drive.list_files_in_folder, request.folder_id)
+            except Exception as exc:
+                logger.error("Falha ao listar pasta Drive folder_id={} error={}", request.folder_id, exc)
+                warnings.append(f"Falha ao listar pasta: {exc}")
+        else:
+            warnings.append("Nenhum folder_id nem file_ids informado.")
+
+        # Upload de cada arquivo para o Moodle
+        for f in files:
+            file_id = f.get("id", "")
+            file_name = f.get("name", "arquivo")
+            mime_type = f.get("mimeType", "application/octet-stream")
+
+            try:
+                # 1) Baixa arquivo do Drive
+                content, final_mime = await asyncio.to_thread(
+                    drive.download_file, file_id, mime_type
+                )
+                b64 = base64.b64encode(content).decode()
+
+                # 2) Upload para draft file area do Moodle
+                draft_result = await self.moodle_service.client.call(
+                    "core_files_upload",
+                    component="user",
+                    filearea="draft",
+                    itemid=0,
+                    filepath="/",
+                    filename=file_name,
+                    filecontent=b64,
+                    contextlevel="course",
+                    instanceid=course_id,
+                )
+                logger.info("Uploaded file to draft area file={} draft_result={}", file_name, draft_result)
+
+                # 3) Cria recurso (mod_resource) no curso
+                resource_result = await self.moodle_service.client.call(
+                    "mod_resource_create_instance",
+                    course=course_id,
+                    name=file_name,
+                    section=request.section_number,
+                    introformat=1,
+                    intro="",
+                )
+                logger.info("Created resource in course file={} course_id={} resource_id={}", file_name, course_id, resource_result)
+                uploaded.append(file_name)
+
+            except Exception as exc:
+                logger.error("Falha upload Drive->Moodle file={} course_id={} error={}", file_name, course_id, exc)
+                failed.append(file_name)
+                warnings.append(f"Falha em {file_name}: {exc}")
+
+        finished_at = datetime.now(UTC)
+        status = "success" if not failed else ("partial" if uploaded else "failed")
+
+        summary = SyncRunSummary(
+            direction=SyncDirection.SHEETS_TO_MOODLE,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=(finished_at - started_at).total_seconds(),
+            processed_counts={"uploaded": len(uploaded), "failed": len(failed)},
+            warnings=warnings,
+            extra={"uploaded": uploaded, "failed": failed, "triggered_by": request.triggered_by},
+        )
+
+        # Registra log estruturado
+        self.state.add_sync_log(
+            direction="sheets_to_moodle",
+            started_at=started_at,
+            finished_at=finished_at,
+            status=status,
+            entity="drive_files",
+            course_id=course_id,
+            records_processed=len(files),
+            records_created=len(uploaded),
+            records_updated=0,
+            records_failed=len(failed),
+            errors=warnings,
+        )
+
+        await self._append_sync_event(summary, status)
+        return summary
 
 
 # Backward compatibility alias

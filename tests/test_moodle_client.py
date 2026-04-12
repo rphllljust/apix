@@ -11,6 +11,7 @@ import httpx
 from app.config import Settings
 from app.exceptions import MoodleConnectionError
 from app.moodle.client import MoodleClient
+from app.moodle.exceptions import MoodleAuthError
 from app.moodle.metrics import MoodleService
 
 
@@ -29,6 +30,18 @@ class FakeMoodleClient:
     async def call(self, wsfunction: str, **params: Any) -> Any:
         self.calls.append((wsfunction, params))
         return self.responses.get(wsfunction, [])
+
+    async def validate_token(self, token: str | None = None) -> dict[str, Any]:
+        _ = token
+        self.calls.append(("core_webservice_get_site_info", {}))
+        response = self.responses.get("core_webservice_get_site_info", {})
+        return {
+            "sitename": response.get("sitename"),
+            "username": response.get("username"),
+            "fullname": response.get("fullname"),
+            "userid": response.get("userid"),
+            "moodle_version": response.get("release"),
+        }
 
 
 class FakeBatchClient:
@@ -59,6 +72,8 @@ def test_moodle_connection_auth_and_courses(test_settings: Settings) -> None:
                 "core_webservice_get_site_info": {
                     "sitename": "AVA IDEP",
                     "username": "api_user",
+                    "fullname": "Administrador AVA",
+                    "userid": 2,
                     "release": "4.3",
                 },
                 "core_course_get_courses": [
@@ -74,6 +89,8 @@ def test_moodle_connection_auth_and_courses(test_settings: Settings) -> None:
 
         assert ping["site_name"] == "AVA IDEP"
         assert ping["username"] == "api_user"
+        assert ping["fullname"] == "Administrador AVA"
+        assert ping["userid"] == 2
         assert len(courses) == 2
         assert courses[0]["fullname"] == "Curso A"
 
@@ -107,7 +124,7 @@ def test_invalid_cpf_is_rejected_with_clear_message(test_settings: Settings) -> 
 
 
 def test_retry_with_exponential_backoff(test_settings: Settings, monkeypatch: Any) -> None:
-    """Simula timeout para validar retries e backoff 2s, 4s, 8s."""
+    """Simula timeout para validar retries e backoff 1s, 2s, 4s."""
 
     async def scenario() -> None:
         client = MoodleClient(test_settings)
@@ -131,7 +148,37 @@ def test_retry_with_exponential_backoff(test_settings: Settings, monkeypatch: An
         await client.close()
 
         assert response == {"ok": True}
-        assert delays == [2.0, 4.0, 8.0]
+        assert delays == [1.0, 2.0, 4.0]
+
+    run_async(scenario)
+
+
+def test_validate_token_detects_errorcode_even_with_http_200(test_settings: Settings) -> None:
+    """Moodle pode retornar 200 com payload de erro; deve virar MoodleAuthError."""
+
+    async def scenario() -> None:
+        settings = test_settings.model_copy(update={"moodle_timeout_seconds": 10})
+        transport = httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={
+                    "errorcode": "invalidtoken",
+                    "message": "Token invalido",
+                },
+            ),
+        )
+        client = MoodleClient(settings)
+        client._http = httpx.AsyncClient(transport=transport, timeout=10.0)
+
+        raised = False
+        try:
+            await client.validate_token("token-invalido")
+        except MoodleAuthError:
+            raised = True
+        finally:
+            await client.close()
+
+        assert raised
 
     run_async(scenario)
 

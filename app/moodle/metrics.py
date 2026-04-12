@@ -11,7 +11,11 @@ from app.moodle.client import MoodleClient
 from app.config import Settings
 from app.exceptions import ValidationError
 from app.moodle.endpoints import get_wsfunction
-from app.moodle.exceptions import MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError
+from app.moodle.exceptions import (
+    MoodleAPIError,
+    MoodleConnectionError,
+    MoodleTokenExpiredError,
+)
 from app.models.schemas import SyncScope
 from app.utils.validators import (
     assert_valid_cpf,
@@ -30,11 +34,13 @@ class MoodleService:
         self._semaphore = asyncio.Semaphore(max_concurrency)
 
     async def ping(self) -> dict[str, Any]:
-        info = await self.client.call("core_webservice_get_site_info")
+        info = await self.client.validate_token()
         return {
             "site_name": info.get("sitename"),
+            "fullname": info.get("fullname"),
             "username": info.get("username"),
-            "moodle_release": info.get("release"),
+            "userid": info.get("userid"),
+            "moodle_release": info.get("moodle_version"),
         }
 
     async def list_course_ids(self, course_ids: list[int] | None = None) -> list[int]:

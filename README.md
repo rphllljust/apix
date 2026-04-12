@@ -56,9 +56,14 @@ cp .env.example .env
 2. Edite `.env` com seus valores reais:
 
 - `MOODLE_BASE_URL`
+- `MOODLE_URL` (alias de compatibilidade)
 - `MOODLE_TOKEN`
+- `MOODLE_WSFORMAT` (`json`)
 - `GOOGLE_CREDENTIALS_FILE`
 - `SPREADSHEET_ID`
+- `GOOGLE_OAUTH_CLIENT_ID` (opcional para login Google Sheets via OAuth)
+- `GOOGLE_OAUTH_CLIENT_SECRET` (opcional para login Google Sheets via OAuth)
+- `GOOGLE_OAUTH_REDIRECT_URI` (ex.: `http://localhost:8000/api/v1/google-sheets/oauth/callback`)
 - `API_SECRET_KEY`
 - `CORS_ALLOWED_ORIGINS`
 
@@ -84,6 +89,23 @@ O script valida:
 - escrita/leitura em aba temporaria
 
 Toda a saida do script esta em portugues brasileiro.
+
+## Login Google Sheets via OAuth (opcional)
+
+Se preferir login Google no painel em vez de `credentials.json`:
+
+1. No Google Cloud, crie credencial OAuth 2.0 (tipo Web).
+2. Adicione no `.env`:
+   - `GOOGLE_OAUTH_CLIENT_ID`
+   - `GOOGLE_OAUTH_CLIENT_SECRET`
+   - `GOOGLE_OAUTH_REDIRECT_URI` (ex.: `http://localhost:8000/api/v1/google-sheets/oauth/callback`)
+3. No painel, use o botao **Login Google Sheets** quando o status estiver offline.
+4. Ao concluir o consentimento, o backend salva `GOOGLE_OAUTH_REFRESH_TOKEN` no `.env` automaticamente.
+5. Se preferir, configure tudo pelo proprio painel em **Configurar Google**:
+   - `GOOGLE_OAUTH_CLIENT_ID`
+   - `GOOGLE_OAUTH_CLIENT_SECRET`
+   - `GOOGLE_OAUTH_REDIRECT_URI`
+   - URL da planilha (o backend extrai o `SPREADSHEET_ID`)
 
 ## 5) Executar localmente
 
@@ -145,6 +167,11 @@ curl http://localhost:8000/api/v1/health
 - `POST /api/v1/sync/course/{course_id}/enrollments`
 - `POST /api/v1/sync/sheets-to-moodle/enroll`
 - `POST /api/v1/auth/token` (emite JWT)
+- `POST /api/v1/config/moodle-token` (valida e salva token do Moodle)
+- `GET /api/v1/config/google-sheets` (consulta configuracao atual do OAuth/planilha)
+- `POST /api/v1/config/google-sheets` (salva OAuth Google e planilha no `.env`)
+- `GET /api/v1/google-sheets/oauth/start` (gera URL de login Google Sheets)
+- `GET /api/v1/google-sheets/oauth/callback` (recebe callback e salva refresh token)
 
 ### Consultas
 

@@ -24,6 +24,15 @@ class MoodleConnectionError(Exception):
     """Timeout ou falha de rede com o Moodle."""
 
 
+class MoodleAuthError(Exception):
+    """Falha de autenticacao/autorizacao no Moodle (token invalido ou sem permissao)."""
+
+    def __init__(self, message: str, errorcode: str = "moodle_auth_error") -> None:
+        self.message = message
+        self.errorcode = errorcode
+        super().__init__(message)
+
+
 class MoodleTokenExpiredError(MoodleAPIError):
     """Token invalido ou expirado."""
 

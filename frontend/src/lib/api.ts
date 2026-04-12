@@ -2,12 +2,29 @@ import axios, { AxiosError } from 'axios'
 import axiosRetry from 'axios-retry'
 import type {
   CourseItem,
+  DriveToMoodleSyncResponse,
+  GoogleSheetsConfigPayload,
+  GoogleSheetsConfigResponse,
+  GoogleSheetsConfigSaveResponse,
+  GoogleSheetsOAuthStartResponse,
   HealthResponse,
+  MoodleTokenConfigResponse,
   SyncLogItem,
   SyncSummaryResponse,
 } from '@/types/api'
 
-const baseURL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+function resolveApiBaseUrl(): string {
+  const envBaseUrl = String(import.meta.env.VITE_API_BASE_URL ?? '').trim()
+  if (envBaseUrl) {
+    return envBaseUrl
+  }
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    return `${window.location.protocol}//${window.location.hostname}:8000`
+  }
+  return 'http://localhost:8000'
+}
+
+const baseURL = resolveApiBaseUrl()
 const apiKey = import.meta.env.VITE_API_KEY ?? ''
 
 export const api = axios.create({
@@ -126,6 +143,55 @@ export async function triggerCourseSync(
 ): Promise<SyncSummaryResponse> {
   const { data } = await api.post<SyncSummaryResponse>(
     `/api/v1/sync/course/${courseId}/${mode}`,
+  )
+  return data
+}
+
+export async function configureMoodleToken(
+  token: string,
+): Promise<MoodleTokenConfigResponse> {
+  const { data } = await api.post<MoodleTokenConfigResponse>(
+    '/api/v1/config/moodle-token',
+    { token },
+  )
+  return data
+}
+
+export async function startGoogleSheetsOAuth(): Promise<GoogleSheetsOAuthStartResponse> {
+  const { data } = await api.get<GoogleSheetsOAuthStartResponse>(
+    '/api/v1/google-sheets/oauth/start',
+  )
+  return data
+}
+
+export async function fetchGoogleSheetsConfig(): Promise<GoogleSheetsConfigResponse> {
+  const { data } = await api.get<GoogleSheetsConfigResponse>(
+    '/api/v1/config/google-sheets',
+  )
+  return data
+}
+
+export async function configureGoogleSheets(
+  payload: GoogleSheetsConfigPayload,
+): Promise<GoogleSheetsConfigSaveResponse> {
+  const { data } = await api.post<GoogleSheetsConfigSaveResponse>(
+    '/api/v1/config/google-sheets',
+    payload,
+  )
+  return data
+}
+
+export async function triggerDriveToMoodleSync(
+  courseId: number,
+  payload?: {
+    folder_id?: string
+    file_ids?: string[]
+    section_number?: number
+  },
+): Promise<DriveToMoodleSyncResponse> {
+  const { data } = await api.post<DriveToMoodleSyncResponse>(
+    `/api/v1/sync/google-drive-to-moodle/${courseId}`,
+    payload ?? {},
   )
   return data
 }

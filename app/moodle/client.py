@@ -1,4 +1,4 @@
-﻿"""Responsabilidade: implementa o modulo app/moodle/client.py."""
+"""Responsabilidade: implementa o modulo app/moodle/client.py."""
 
 from __future__ import annotations
 
@@ -10,7 +10,12 @@ import httpx
 from loguru import logger
 
 from app.config import Settings
-from app.moodle.exceptions import MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError
+from app.moodle.exceptions import (
+    MoodleAPIError,
+    MoodleAuthError,
+    MoodleConnectionError,
+    MoodleTokenExpiredError,
+)
 from app.utils.security import sanitize_text
 
 
@@ -62,18 +67,120 @@ class MoodleClient:
     def _build_payload(self, wsfunction: str, params: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "wstoken": self.settings.moodle_token,
-            "moodlewsrestformat": "json",
+            "moodlewsrestformat": self.settings.moodle_ws_format,
             "wsfunction": wsfunction,
         }
         for key, value in params.items():
             self._flatten(key, value, payload)
         return payload
 
+    @staticmethod
+    def _extract_moodle_error(body: Any) -> tuple[str, str, str] | None:
+        if not isinstance(body, dict):
+            return None
+        has_exception = bool(body.get("exception"))
+        has_errorcode = bool(body.get("errorcode"))
+        if not has_exception and not has_errorcode:
+            return None
+
+        errorcode = str(body.get("errorcode") or body.get("exception") or "unknown_error")
+        message = str(body.get("message") or body.get("error") or "Erro sem detalhes")
+        debuginfo = str(body.get("debuginfo") or "")
+        return errorcode, message, debuginfo
+
+    @staticmethod
+    def _is_auth_error(errorcode: str, message: str, debuginfo: str = "") -> bool:
+        hints = f"{errorcode} {message} {debuginfo}".lower()
+        return any(
+            token in hints
+            for token in (
+                "token",
+                "invalidtoken",
+                "accessexception",
+                "notauthorised",
+                "nopermissions",
+                "invalidparameter",
+            )
+        )
+
+    def _raise_from_moodle_error(
+        self,
+        wsfunction: str,
+        errorcode: str,
+        message: str,
+        debuginfo: str,
+        *,
+        auth_context: bool,
+    ) -> None:
+        logger.error(
+            "Falha final Moodle wsfunction={} errorcode={}",
+            wsfunction,
+            self._sanitize(errorcode),
+        )
+
+        if auth_context:
+            raise MoodleAuthError(
+                "Token do Moodle invalido, expirado ou sem permissao para consultar o AVA.",
+                errorcode=errorcode,
+            )
+
+        if self._is_auth_error(errorcode, message, debuginfo):
+            raise MoodleTokenExpiredError(
+                errorcode=errorcode,
+                message=message,
+                debuginfo=debuginfo,
+            )
+
+        permission_hints = f"{errorcode} {message} {debuginfo}".lower()
+        if any(
+            term in permission_hints
+            for term in ("nopermissions", "accessdenied", "requirecapability", "permission")
+        ):
+            capabilities = self._extract_capabilities(permission_hints)
+            if capabilities:
+                logger.error(
+                    "Sugestao Moodle wsfunction={}: habilite capabilities para o token/perfil: {}",
+                    wsfunction,
+                    ", ".join(capabilities),
+                )
+            else:
+                logger.error(
+                    "Sugestao Moodle wsfunction={}: revise as capabilities do perfil do token.",
+                    wsfunction,
+                )
+
+        raise MoodleAPIError(
+            errorcode=errorcode,
+            message=f"{errorcode}: {message}",
+            debuginfo=debuginfo,
+        )
+
     async def _request_once(self, wsfunction: str, params: dict[str, Any]) -> Any:
         payload = self._build_payload(wsfunction, params)
         response = await self._http.post(self.endpoint_url, data=payload)
         if response.status_code >= 500:
             response.raise_for_status()
+
+        try:
+            body = response.json()
+        except ValueError as exc:
+            logger.error("Falha final Moodle wsfunction={} error=invalid_json", wsfunction)
+            raise MoodleAPIError(
+                errorcode="invalid_json",
+                message="Resposta invalida do Moodle (nao-JSON).",
+            ) from exc
+
+        moodle_error = self._extract_moodle_error(body)
+        if moodle_error is not None:
+            errorcode, message, debuginfo = moodle_error
+            self._raise_from_moodle_error(
+                wsfunction,
+                errorcode,
+                message,
+                debuginfo,
+                auth_context=False,
+            )
+
         if response.status_code >= 400:
             logger.error(
                 "Falha final Moodle wsfunction={} status_code={}",
@@ -85,69 +192,12 @@ class MoodleClient:
                 message=f"HTTP {response.status_code} em {wsfunction}.",
             )
 
-        try:
-            body = response.json()
-        except ValueError as exc:
-            logger.error("Falha final Moodle wsfunction={} error=invalid_json", wsfunction)
-            raise MoodleAPIError(
-                errorcode="invalid_json",
-                message="Resposta invalida do Moodle (nao-JSON).",
-            ) from exc
-
-        if isinstance(body, dict) and body.get("exception"):
-            errorcode = str(body.get("errorcode", "unknown_error"))
-            message = str(body.get("message", "Erro sem detalhes"))
-            debuginfo = str(body.get("debuginfo", "") or "")
-            token_hints = f"{errorcode} {message}".lower()
-            if "token" in token_hints or "invalidtoken" in token_hints:
-                logger.error(
-                    "Falha final Moodle wsfunction={} errorcode={} (token expirado/invalido)",
-                    wsfunction,
-                    self._sanitize(errorcode),
-                )
-                raise MoodleTokenExpiredError(
-                    errorcode=errorcode,
-                    message=message,
-                    debuginfo=debuginfo,
-                )
-            message = (
-                f"{errorcode}: "
-                f"{message}"
-            )
-            logger.error(
-                "Falha final Moodle wsfunction={} errorcode={}",
-                wsfunction,
-                self._sanitize(errorcode),
-            )
-            permission_hints = f"{errorcode} {message} {debuginfo}".lower()
-            if any(
-                term in permission_hints
-                for term in ("nopermissions", "accessdenied", "requirecapability", "permission")
-            ):
-                capabilities = self._extract_capabilities(permission_hints)
-                if capabilities:
-                    logger.error(
-                        "Sugestao Moodle wsfunction={}: habilite capabilities para o token/perfil: {}",
-                        wsfunction,
-                        ", ".join(capabilities),
-                    )
-                else:
-                    logger.error(
-                        "Sugestao Moodle wsfunction={}: revise as capabilities do perfil do token (ex.: webservice/rest:use e capacidades da funcao).",
-                        wsfunction,
-                    )
-            raise MoodleAPIError(
-                errorcode=errorcode,
-                message=message,
-                debuginfo=debuginfo,
-            )
-
         return body
 
     async def _request(self, wsfunction: str, params: dict[str, Any]) -> Any:
         max_retries = max(0, int(self.settings.moodle_max_retries))
         max_attempts = 1 + max_retries
-        backoff_seconds = 2.0
+        backoff_seconds = 1.0
         last_error: Exception | None = None
 
         for attempt in range(1, max_attempts + 1):
@@ -166,7 +216,7 @@ class MoodleClient:
                     self._sanitize(exc),
                 )
                 await asyncio.sleep(backoff_seconds)
-                backoff_seconds = min(backoff_seconds * 2, 8.0)
+                backoff_seconds = min(backoff_seconds * 2, 4.0)
 
         logger.error(
             "Falha final Moodle wsfunction={} apos {} tentativa(s)",
@@ -182,7 +232,7 @@ class MoodleClient:
     async def call(self, wsfunction: str, **params: Any) -> Any:
         try:
             return await self._request(wsfunction, params)
-        except (MoodleAPIError, MoodleConnectionError):
+        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError):
             raise
         except Exception as exc:  # pragma: no cover - fallback defensivo
             logger.error(
@@ -195,3 +245,80 @@ class MoodleClient:
                 message=self._sanitize(f"Erro inesperado em {wsfunction}: {exc}"),
             ) from exc
 
+    async def validate_token(self, token: str | None = None) -> dict[str, Any]:
+        token_value = str(token or self.settings.moodle_token).strip()
+        if not token_value:
+            raise MoodleAuthError("Token do Moodle nao informado.", errorcode="missing_token")
+
+        query = {
+            "wstoken": token_value,
+            "wsfunction": "core_webservice_get_site_info",
+            "moodlewsrestformat": self.settings.moodle_ws_format,
+        }
+
+        retry_delays = [1.0, 2.0, 4.0]
+        max_attempts = len(retry_delays) + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self._http.get(self.endpoint_url, params=query, timeout=10.0)
+                if response.status_code >= 500:
+                    response.raise_for_status()
+
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise MoodleConnectionError(
+                        "Resposta invalida do AVA ao validar token.",
+                    ) from exc
+
+                moodle_error = self._extract_moodle_error(body)
+                if moodle_error is not None:
+                    errorcode, message, debuginfo = moodle_error
+                    self._raise_from_moodle_error(
+                        "core_webservice_get_site_info",
+                        errorcode,
+                        message,
+                        debuginfo,
+                        auth_context=True,
+                    )
+
+                if response.status_code >= 400:
+                    raise MoodleConnectionError(
+                        f"AVA indisponivel no momento (HTTP {response.status_code}).",
+                    )
+
+                if not isinstance(body, dict):
+                    raise MoodleAuthError(
+                        "Resposta inesperada ao validar token no AVA.",
+                        errorcode="invalid_payload",
+                    )
+
+                return {
+                    "username": str(body.get("username") or ""),
+                    "fullname": str(body.get("fullname") or ""),
+                    "sitename": str(body.get("sitename") or ""),
+                    "moodle_version": str(body.get("release") or body.get("version") or ""),
+                    "userid": int(body.get("userid") or 0),
+                }
+            except MoodleAuthError:
+                raise
+            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError, MoodleConnectionError) as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    break
+                delay = retry_delays[attempt - 1]
+                logger.warning(
+                    "Retry Moodle token validation retry={}/3 wait={}s error={}",
+                    attempt,
+                    delay,
+                    self._sanitize(exc),
+                )
+                await asyncio.sleep(delay)
+
+        raise MoodleConnectionError(
+            self._sanitize(
+                f"Nao foi possivel conectar ao AVA para validar token apos {max_attempts} tentativa(s): {last_error}",
+            ),
+        )

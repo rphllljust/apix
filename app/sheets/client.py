@@ -8,6 +8,8 @@ from datetime import date, datetime
 from typing import Any
 
 import gspread
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError, WorksheetNotFound
 from loguru import logger
@@ -42,12 +44,36 @@ def _serialize(value: Any) -> str:
 
 
 class GoogleSheetsClient:
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        creds = Credentials.from_service_account_file(
+    @staticmethod
+    def _is_oauth_configured(settings: Settings) -> bool:
+        return bool(
+            settings.google_oauth_refresh_token
+            and settings.google_oauth_client_id
+            and settings.google_oauth_client_secret
+        )
+
+    @classmethod
+    def _build_credentials(cls, settings: Settings) -> Credentials | OAuthCredentials:
+        if cls._is_oauth_configured(settings):
+            creds = OAuthCredentials(
+                token=None,
+                refresh_token=settings.google_oauth_refresh_token,
+                token_uri="https://oauth2.googleapis.com/token",
+                client_id=settings.google_oauth_client_id,
+                client_secret=settings.google_oauth_client_secret,
+                scopes=SHEETS_SCOPES,
+            )
+            creds.refresh(GoogleAuthRequest())
+            return creds
+
+        return Credentials.from_service_account_file(
             settings.google_service_account_file,
             scopes=SHEETS_SCOPES,
         )
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        creds = self._build_credentials(settings)
         self._client = gspread.authorize(creds)
         self._spreadsheet = self._client.open_by_key(settings.google_spreadsheet_id)
 

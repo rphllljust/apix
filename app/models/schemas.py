@@ -111,3 +111,40 @@ class SheetsEnrollRequest(BaseModel):
     course_id: int
     dry_run: bool = False
 
+
+class MoodleTokenConfigRequest(BaseModel):
+    token: str
+
+
+class GoogleSheetsOAuthConfigRequest(BaseModel):
+    client_id: str
+    client_secret: str
+    redirect_uri: str
+    spreadsheet: str
+
+
+class DriveFileItem(BaseModel):
+    """Representa um arquivo do Google Drive."""
+
+    file_id: str
+    name: str
+    mime_type: str
+    exported_as: str = "application/pdf"
+
+
+class DriveToMoodleRequest(BaseModel):
+    """Requisição para sincronizar arquivos do Google Drive para o Moodle."""
+
+    folder_id: str | None = None
+    file_ids: list[str] | None = None
+    section_number: int = 0
+    triggered_by: str = "api"
+
+
+class DriveToMoodleSyncResult(BaseModel):
+    """Resultado da sincronização Drive → Moodle."""
+
+    uploaded: list[str] = Field(default_factory=list)
+    failed: list[str] = Field(default_factory=list)
+    duration_seconds: float
+

@@ -66,11 +66,31 @@ def get_settings(request: Request) -> Settings:
 
 
 def get_moodle_service(request: Request) -> MoodleService:
-    return request.app.state.moodle_service
+    moodle_service = getattr(request.app.state, "moodle_service", None)
+    if moodle_service is None:
+        startup_error = getattr(request.app.state, "startup_error", None)
+        detail = "Servico Moodle indisponivel no momento."
+        if startup_error:
+            detail = f"{detail} Motivo do startup: {startup_error}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        )
+    return moodle_service
 
 
 def get_sync_engine(request: Request) -> SyncEngine:
-    return request.app.state.sync_engine
+    sync_engine = getattr(request.app.state, "sync_engine", None)
+    if sync_engine is None:
+        startup_error = getattr(request.app.state, "startup_error", None)
+        detail = "Servico de sincronizacao indisponivel no momento."
+        if startup_error:
+            detail = f"{detail} Motivo do startup: {startup_error}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        )
+    return sync_engine
 
 
 def build_sync_engine(settings: Settings) -> tuple[MoodleClient, MoodleService, SyncEngine]:
