@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from html import unescape
 from datetime import date, datetime
 from typing import Any
@@ -45,6 +46,20 @@ def _serialize(value: Any) -> str:
     return str(value)
 
 
+def _to_json_safe(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): _to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_to_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
 def _extract_apps_script_html_error(raw_html: str) -> str:
     clean_text = re.sub(r"<[^>]+>", " ", str(raw_html or ""))
     clean_text = unescape(re.sub(r"\s+", " ", clean_text)).strip()
@@ -54,6 +69,27 @@ def _extract_apps_script_html_error(raw_html: str) -> str:
     if clean_text:
         return clean_text[:220]
     return ""
+
+
+def _normalize_for_match(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
+    return normalized.encode("ascii", "ignore").decode("ascii").lower().strip()
+
+
+def _is_apps_unknown_action_error(message: str, action: str) -> bool:
+    normalized_message = _normalize_for_match(message)
+    normalized_action = _normalize_for_match(action)
+    if normalized_action not in normalized_message:
+        return False
+    if "funcao de script nao encontrada" in normalized_message:
+        return True
+    if "acao desconhecida" in normalized_message:
+        return True
+    if "unknown action" in normalized_message:
+        return True
+    if "desconhecida" in normalized_message:
+        return True
+    return False
 
 
 class GoogleSheetsClient:
@@ -121,7 +157,7 @@ class GoogleSheetsClient:
         try:
             response = httpx.post(
                 self._apps_script_url,
-                json=body,
+                json=_to_json_safe(body),
                 timeout=float(self.settings.google_apps_script_timeout_seconds or 20.0),
                 headers={"Content-Type": "application/json"},
                 follow_redirects=True,
@@ -142,6 +178,10 @@ class GoogleSheetsClient:
             raise SheetsSyncError(
                 f"Falha de conexao com Apps Script ({action}): {exc}",
             ) from exc
+        except TypeError as exc:
+            raise SheetsSyncError(
+                f"Payload invalido enviado ao Apps Script ({action}): {exc}",
+            ) from exc
         except ValueError as exc:
             raise SheetsSyncError(
                 f"Resposta invalida do Apps Script ({action}).",
@@ -154,6 +194,40 @@ class GoogleSheetsClient:
         if isinstance(data, dict) and "result" in data:
             return data.get("result")
         return data
+
+    def _normalize_records_for_headers(
+        self,
+        records: list[dict[str, Any]],
+        headers: list[str] | None = None,
+    ) -> tuple[list[str], list[dict[str, str]]]:
+        provided_headers = [str(header) for header in (headers or []) if str(header)]
+        incoming_headers = list(dict.fromkeys(str(key) for record in records for key in record.keys()))
+        merged_headers = provided_headers + [header for header in incoming_headers if header not in provided_headers]
+        normalized_rows = [
+            {header: _serialize(record.get(header)) for header in merged_headers}
+            for record in records
+        ]
+        return merged_headers, normalized_rows
+
+    def _apps_overwrite_records_legacy(
+        self,
+        sheet_name: str,
+        records: list[dict[str, Any]],
+        headers: list[str] | None = None,
+    ) -> int:
+        merged_headers, normalized_rows = self._normalize_records_for_headers(records, headers)
+        self._apps_call("clear_sheet", {"sheet_name": sheet_name})
+        if normalized_rows:
+            self._apps_call(
+                "append_records",
+                {"sheet_name": sheet_name, "records": normalized_rows},
+            )
+        elif merged_headers:
+            self._apps_call(
+                "ensure_headers",
+                {"sheet_name": sheet_name, "required_headers": merged_headers},
+            )
+        return len(records)
 
     @staticmethod
     def _is_quota_error(exc: APIError) -> bool:
@@ -266,10 +340,25 @@ class GoogleSheetsClient:
 
     def read_records_with_row_number(self, sheet_name: str) -> list[dict[str, str | int]]:
         if getattr(self, "_use_apps_script", False):
-            result = self._apps_call(
-                "read_records_with_row_number",
-                {"sheet_name": sheet_name},
-            )
+            try:
+                result = self._apps_call(
+                    "read_records_with_row_number",
+                    {"sheet_name": sheet_name},
+                )
+            except SheetsSyncError as exc:
+                message = str(exc)
+                # Compatibilidade com Apps Script antigo que ainda nao implementa
+                # read_records_with_row_number.
+                if _is_apps_unknown_action_error(message, "read_records_with_row_number"):
+                    fallback_rows = self.read_records(sheet_name)
+                    rows: list[dict[str, str | int]] = []
+                    for idx, row in enumerate(fallback_rows, start=2):
+                        normalized: dict[str, str | int] = {"_row_number": idx}
+                        for key, value in row.items():
+                            normalized[str(key)] = str(value or "")
+                        rows.append(normalized)
+                    return rows
+                raise
             if isinstance(result, list):
                 rows: list[dict[str, str | int]] = []
                 for row in result:
@@ -315,10 +404,51 @@ class GoogleSheetsClient:
         key_fields: list[str],
     ) -> dict[str, int]:
         if getattr(self, "_use_apps_script", False):
-            result = self._apps_call(
-                "upsert_records",
-                {"sheet_name": sheet_name, "records": records, "key_fields": key_fields},
-            )
+            try:
+                result = self._apps_call(
+                    "upsert_records",
+                    {"sheet_name": sheet_name, "records": records, "key_fields": key_fields},
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "upsert_records"):
+                    logger.warning("Apps Script sem suporte a 'upsert_records'; aplicando fallback legado.")
+                    existing_rows = self.read_records(sheet_name)
+                    all_headers = list(
+                        dict.fromkeys(
+                            [*(str(key) for row in existing_rows for key in row.keys()), *(str(key) for row in records for key in row.keys())],
+                        ),
+                    )
+                    normalized_existing = [
+                        {header: _serialize(row.get(header)) for header in all_headers}
+                        for row in existing_rows
+                    ]
+                    index: dict[tuple[str, ...], int] = {}
+                    for idx, row in enumerate(normalized_existing):
+                        key = tuple(str(row.get(field, "")).strip() for field in key_fields)
+                        if all(key):
+                            index[key] = idx
+
+                    inserted = 0
+                    updated = 0
+                    for record in records:
+                        normalized = {header: _serialize(record.get(header)) for header in all_headers}
+                        key = tuple(str(normalized.get(field, "")).strip() for field in key_fields)
+                        if all(key) and key in index:
+                            normalized_existing[index[key]] = normalized
+                            updated += 1
+                            continue
+                        normalized_existing.append(normalized)
+                        if all(key):
+                            index[key] = len(normalized_existing) - 1
+                        inserted += 1
+
+                    self._apps_overwrite_records_legacy(
+                        sheet_name,
+                        normalized_existing,
+                        all_headers,
+                    )
+                    return {"inserted": inserted, "updated": updated}
+                raise
             if isinstance(result, dict):
                 return {
                     "inserted": int(result.get("inserted", 0) or 0),
@@ -390,10 +520,16 @@ class GoogleSheetsClient:
         headers: list[str] | None = None,
     ) -> int:
         if getattr(self, "_use_apps_script", False):
-            result = self._apps_call(
-                "overwrite_records",
-                {"sheet_name": sheet_name, "records": records, "headers": headers or []},
-            )
+            try:
+                result = self._apps_call(
+                    "overwrite_records",
+                    {"sheet_name": sheet_name, "records": records, "headers": headers or []},
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "overwrite_records"):
+                    logger.warning("Apps Script sem suporte a 'overwrite_records'; aplicando fallback legado.")
+                    return self._apps_overwrite_records_legacy(sheet_name, records, headers)
+                raise
             if isinstance(result, (int, float, str)):
                 try:
                     return int(result)
@@ -426,15 +562,23 @@ class GoogleSheetsClient:
         rows: list[list[Any]],
     ) -> int:
         if getattr(self, "_use_apps_script", False):
-            result = self._apps_call(
-                "overwrite_table_with_subheader",
-                {
-                    "sheet_name": sheet_name,
-                    "headers": headers,
-                    "subheader": subheader,
-                    "rows": rows,
-                },
-            )
+            try:
+                result = self._apps_call(
+                    "overwrite_table_with_subheader",
+                    {
+                        "sheet_name": sheet_name,
+                        "headers": headers,
+                        "subheader": subheader,
+                        "rows": rows,
+                    },
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "overwrite_table_with_subheader"):
+                    logger.warning(
+                        "Apps Script sem suporte a 'overwrite_table_with_subheader'; atualizacao ignorada.",
+                    )
+                    return 0
+                raise
             if isinstance(result, (int, float, str)):
                 try:
                     return int(result)
@@ -464,10 +608,16 @@ class GoogleSheetsClient:
         if not row_numbers:
             return
         if getattr(self, "_use_apps_script", False):
-            self._apps_call(
-                "clear_rows",
-                {"sheet_name": sheet_name, "row_numbers": row_numbers},
-            )
+            try:
+                self._apps_call(
+                    "clear_rows",
+                    {"sheet_name": sheet_name, "row_numbers": row_numbers},
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "clear_rows"):
+                    logger.warning("Apps Script sem suporte a 'clear_rows'; limpeza de linhas ignorada.")
+                    return
+                raise
             return
 
         try:
@@ -499,15 +649,21 @@ class GoogleSheetsClient:
         if not updates:
             return
         if getattr(self, "_use_apps_script", False):
-            self._apps_call(
-                "update_sync_status_rows",
-                {
-                    "sheet_name": sheet_name,
-                    "updates": updates,
-                    "status_header": status_header,
-                    "error_header": error_header,
-                },
-            )
+            try:
+                self._apps_call(
+                    "update_sync_status_rows",
+                    {
+                        "sheet_name": sheet_name,
+                        "updates": updates,
+                        "status_header": status_header,
+                        "error_header": error_header,
+                    },
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "update_sync_status_rows"):
+                    logger.warning("Apps Script sem suporte a 'update_sync_status_rows'; status por linha ignorado.")
+                    return
+                raise
             return
 
         try:
@@ -536,10 +692,16 @@ class GoogleSheetsClient:
 
     def append_event(self, sheet_name: str, payload: dict[str, Any]) -> None:
         if getattr(self, "_use_apps_script", False):
-            self._apps_call(
-                "append_event",
-                {"sheet_name": sheet_name, "payload": payload},
-            )
+            try:
+                self._apps_call(
+                    "append_event",
+                    {"sheet_name": sheet_name, "payload": payload},
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "append_event"):
+                    logger.warning("Apps Script sem suporte a 'append_event'; log de evento em planilha ignorado.")
+                    return
+                raise
             return
 
         try:
@@ -562,10 +724,16 @@ class GoogleSheetsClient:
 
     def apply_alunos_layout(self, sheet_name: str, header_count: int) -> None:
         if getattr(self, "_use_apps_script", False):
-            self._apps_call(
-                "apply_alunos_layout",
-                {"sheet_name": sheet_name, "header_count": int(header_count)},
-            )
+            try:
+                self._apps_call(
+                    "apply_alunos_layout",
+                    {"sheet_name": sheet_name, "header_count": int(header_count)},
+                )
+            except SheetsSyncError as exc:
+                if _is_apps_unknown_action_error(str(exc), "apply_alunos_layout"):
+                    logger.warning("Apps Script sem suporte a 'apply_alunos_layout'; formatacao ignorada.")
+                    return
+                raise
             return
 
         try:

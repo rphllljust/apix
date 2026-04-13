@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from app.exceptions import MoodleAuthError
 from app.models.database import SyncStateStore
 from app.models.schemas import MoodleToSheetsRequest
 from app.sheets.formatters import to_course_students_sheet_name
@@ -307,6 +308,40 @@ def test_normalize_google_forms_columns_for_enrollment() -> None:
     assert normalized[0]["course_id"] == "125"
 
 
+def test_expand_compact_csv_row_with_status_columns() -> None:
+    """Expande coluna CSV mesmo quando existem colunas de status auxiliares."""
+    rows = [
+        {
+            "_row_number": 2,
+            "cpf,email,nome,curso_id,status": "52998224725,aluno.teste@gmail.com,Aluno Teste Silva,125,ativo",
+            "Status Sync": "sucesso",
+            "Erro": "",
+        },
+    ]
+
+    expanded = SyncEngine._expand_compact_csv_rows(rows)
+
+    assert expanded[0]["cpf"] == "52998224725"
+    assert expanded[0]["email"] == "aluno.teste@gmail.com"
+    assert expanded[0]["nome"] == "Aluno Teste Silva"
+    assert expanded[0]["curso_id"] == "125"
+    assert expanded[0]["Status Sync"] == "sucesso"
+
+
+def test_resolve_field_name_marks_ambiguous_as_unrecognized() -> None:
+    """Quando houver colisao de aliases, classifica como nao reconhecido com sugestao."""
+    alias_map = {
+        "username": {"documento"},
+        "email": {"documento"},
+    }
+
+    resolved = SyncEngine._resolve_field_name("documento", alias_map)
+
+    assert resolved["status"] == "campo_nao_reconhecido"
+    assert resolved["motivo"] == "ambiguidade"
+    assert resolved["campo_moodle_sugerido"] == "username"
+
+
 def test_sync_idempotency_same_data_after_two_runs(tmp_path: Path) -> None:
     """Executa sync duas vezes e garante ausencia de duplicacao de dados."""
 
@@ -341,6 +376,35 @@ def test_sync_idempotency_same_data_after_two_runs(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_sync_moodle_to_sheets_handles_permission_error_as_partial(tmp_path: Path) -> None:
+    """Permissao insuficiente no Moodle vira warning parcial, sem quebrar endpoint."""
+
+    async def scenario() -> None:
+        moodle_service = FakeMoodleService()
+
+        async def denied_collect_metrics(
+            course_id: int,
+            _: Any,
+        ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
+            _ = course_id
+            raise MoodleAuthError("Sem permissao para listar usuarios do curso.", errorcode="accessexception")
+
+        moodle_service.collect_course_metrics = denied_collect_metrics  # type: ignore[assignment]
+        engine, sheets = build_engine(tmp_path, moodle_service=moodle_service)
+
+        summary = await engine.sync_moodle_to_sheets(MoodleToSheetsRequest())
+
+        assert summary.direction.value == "moodle_to_sheets"
+        assert summary.processed_counts["students_inserted"] == 0
+        assert summary.processed_counts["enrollments_inserted"] == 0
+        assert any("Falha ao coletar metricas do curso 125" in item for item in summary.warnings)
+        assert any("dados existentes em planilhas foram preservados" in item for item in summary.warnings)
+        assert "students" not in sheets.tables
+        assert "enrollments" not in sheets.tables
+
+    asyncio.run(scenario())
+
+
 def test_sync_sheet_to_moodle_enroll_upsert_user_and_enroll(tmp_path: Path) -> None:
     """Executa fluxo completo da aba de inscricao (upsert + matricula) com status por linha."""
 
@@ -355,6 +419,7 @@ def test_sync_sheet_to_moodle_enroll_upsert_user_and_enroll(tmp_path: Path) -> N
                 "Local que pretende fazer o curso": "Curso 125 - Turma A",
                 "Nome completo": "Maria Conceicao Silva",
                 "CPF": "390.533.447-05",
+                "Campo livre nao mapeado": "qualquer valor",
             },
             {
                 "_row_number": 3,
@@ -395,5 +460,11 @@ def test_sync_sheet_to_moodle_enroll_upsert_user_and_enroll(tmp_path: Path) -> N
         assert status_by_row[2]["error"] == ""
         assert status_by_row[3]["status"] == "erro"
         assert "gmail" in str(status_by_row[3]["error"]).lower()
+
+        normalizacao = summary.extra.get("normalizacao_campos") or {}
+        totais = normalizacao.get("totais") or {}
+        assert normalizacao.get("schema") == "normalizacao_campos_v1"
+        assert int(totais.get("total_campos_avaliados", 0)) > 0
+        assert int(totais.get("campo_nao_reconhecido", 0)) >= 1
 
     asyncio.run(scenario())

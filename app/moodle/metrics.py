@@ -1,4 +1,4 @@
-﻿"""Responsabilidade: implementa o modulo app/moodle/metrics.py."""
+"""Responsabilidade: implementa o modulo app/moodle/metrics.py."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from app.config import Settings
 from app.exceptions import ValidationError
 from app.moodle.endpoints import get_wsfunction
 from app.moodle.exceptions import (
+    MoodleAuthError,
     MoodleAPIError,
     MoodleConnectionError,
     MoodleTokenExpiredError,
@@ -117,7 +118,7 @@ class MoodleService:
                 async with self._semaphore:
                     response = await self.client.call(wsfunction, **params)
                 return wsfunction, response
-            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                 last_error = exc
                 logger.debug(
                     "Moodle wsfunction failed wsfunction={} params={} err={}",
@@ -286,7 +287,7 @@ class MoodleService:
         ]
         try:
             source_function, payload = await self._try_first_success(calls)
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             return [], [f"Notas indisponiveis curso={course_id} user={user_id}: {exc}"]
 
         rows = self._extract_grade_items(payload)
@@ -305,7 +306,7 @@ class MoodleService:
 
         try:
             contents = await self.get_course_contents(course_id)
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             return [], [f"Conteudo do curso indisponivel para notas detalhadas curso={course_id}: {exc}"]
 
         assignment_ids: list[int] = []
@@ -351,7 +352,7 @@ class MoodleService:
                                 "raw": grade,
                             },
                         )
-            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                 warnings.append(f"mod_assign_get_grades indisponivel curso={course_id}: {exc}")
 
         for quiz_id, quiz_name in quizzes:
@@ -414,11 +415,11 @@ class MoodleService:
                                         "raw": review_payload,
                                     },
                                 )
-                            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+                            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                                 warnings.append(
                                     f"mod_quiz_get_attempt_review indisponivel attempt={attempt_id}: {exc}",
                                 )
-                except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+                except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                     warnings.append(
                         f"mod_quiz_get_user_attempts indisponivel quiz={quiz_id} user={user_id}: {exc}",
                     )
@@ -504,7 +505,7 @@ class MoodleService:
                     "source_function": source_function,
                 },
             )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Conclusao de atividades indisponivel curso={course_id} user={user_id}: {exc}")
 
         try:
@@ -523,7 +524,7 @@ class MoodleService:
                         "raw": status,
                     },
                 )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Progresso do curso indisponivel curso={course_id} user={user_id}: {exc}")
 
         try:
@@ -537,7 +538,7 @@ class MoodleService:
                     "raw": payload,
                 },
             )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(
                 f"Navegacao do curso indisponivel curso={course_id} user={user_id}: {exc}",
             )
@@ -574,7 +575,7 @@ class MoodleService:
                     },
                 )
             return rows, warnings
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Logs agregados indisponiveis para curso={course_id}: {exc}")
 
         for user_id in user_ids:
@@ -599,7 +600,7 @@ class MoodleService:
                             "raw": log,
                         },
                     )
-            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                 warnings.append(f"Logs por usuario indisponiveis curso={course_id} user={user_id}: {exc}")
 
         return rows, warnings
@@ -613,7 +614,7 @@ class MoodleService:
             source_function, payload = await self._try_first_success(
                 [(get_wsfunction("participation", "badges"), {"userid": user_id})],
             )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             return [], [f"Badges indisponiveis curso={course_id} user={user_id}: {exc}"]
 
         badges = self._find_payload_rows(payload, ["badges", "items", "data"])
@@ -650,7 +651,7 @@ class MoodleService:
         ]
         try:
             source_function, payload = await self._try_first_success(calls)
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             return [], [f"Competencias indisponiveis curso={course_id} user={user_id}: {exc}"]
 
         competencies = self._find_payload_rows(
@@ -692,7 +693,7 @@ class MoodleService:
                         "raw": group,
                     },
                 )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Grupos indisponiveis curso={course_id}: {exc}")
         return rows, warnings
 
@@ -711,7 +712,7 @@ class MoodleService:
             source_function, payload = await self._try_first_success(
                 [(get_wsfunction("participation", "group_members"), {"groupids": group_ids})],
             )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             return [], [f"Membros de grupo indisponiveis curso={course_id}: {exc}"]
 
         members_rows = self._find_payload_rows(payload, ["groups", "groupmembers", "data", "items"])
@@ -776,7 +777,7 @@ class MoodleService:
                         "raw": grouping,
                     },
                 )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Agrupamentos indisponiveis curso={course_id}: {exc}")
         return rows, warnings
 
@@ -797,7 +798,7 @@ class MoodleService:
                             "raw": entry,
                         },
                     )
-            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                 warnings.append(
                     f"Metrica personalizada indisponivel wsfunction={wsfunction} curso={course_id}: {exc}",
                 )
@@ -809,7 +810,11 @@ class MoodleService:
         scope: SyncScope,
     ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
         warnings: list[str] = []
-        users = await self.get_enrolled_users(course_id)
+        try:
+            users = await self.get_enrolled_users(course_id)
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+            warnings.append(f"Usuarios/matriculas indisponiveis curso={course_id}: {exc}")
+            users = []
 
         students: list[dict[str, Any]] = []
         enrollments: list[dict[str, Any]] = []
@@ -949,7 +954,7 @@ class MoodleService:
                         "raw": course,
                     },
                 )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Cursos indisponiveis: {exc}")
 
         try:
@@ -966,7 +971,7 @@ class MoodleService:
                         "raw": category,
                     },
                 )
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
             warnings.append(f"Categorias indisponiveis: {exc}")
 
         for course_id in course_ids:
@@ -1001,7 +1006,7 @@ class MoodleService:
                                 "raw": module,
                             },
                         )
-            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError) as exc:
                 warnings.append(f"Conteudo indisponivel para curso={course_id}: {exc}")
 
         return {
@@ -1159,7 +1164,7 @@ class MoodleService:
 
             try:
                 user_id = await self._resolve_user_id(payload) if action in {"update", "upsert"} else None
-            except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError):
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError):
                 user_id = None
 
             if user_id is None and email:
@@ -1169,7 +1174,7 @@ class MoodleService:
                         users = await self._search_users("email", email)
                     if users:
                         user_id = int(users[0]["id"])
-                except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError):
+                except (MoodleAuthError, MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError):
                     user_id = None
 
             user_data = {
@@ -1291,6 +1296,7 @@ class MoodleService:
                     )
 
         return counts, warnings, processed_rows
+
 
 
 

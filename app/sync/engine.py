@@ -6,7 +6,9 @@ import asyncio
 import base64
 import csv
 import re
+import unicodedata
 from datetime import UTC, date, datetime
+from difflib import SequenceMatcher
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +16,7 @@ from loguru import logger
 
 from app.sheets.client import GoogleSheetsClient
 from app.sheets.drive import GoogleDriveClient
+from app.sheets.exceptions import SheetsSyncError
 from app.sheets.formatters import (
     to_course_detailed_grades_sheet_name,
     to_course_students_sheet_name,
@@ -30,9 +33,67 @@ from app.models.schemas import (
 )
 from app.moodle.metrics import MoodleService
 from app.models.database import SyncStateStore
+from app.exceptions import MoodleAPIError, MoodleAuthError, MoodleConnectionError
+from app.utils.validators import is_valid_email
 
 
 class SyncEngine:
+    _INPUT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+        "username": (
+            "cpf",
+            "username",
+            "usuario",
+            "moodle username",
+            "moodle_username",
+            "moodle user",
+            "cpf do aluno",
+            "documento",
+        ),
+        "email": (
+            "email",
+            "e-mail",
+            "mail",
+            "email - (obrigatoriamente gmail)",
+            "email obrigatoriamente gmail",
+        ),
+        "full_name": (
+            "nome completo",
+            "nome",
+            "student name",
+            "nome do aluno",
+            "aluno",
+        ),
+        "course_id": (
+            "curso id",
+            "curso_id",
+            "course id",
+            "course_id",
+            "curso",
+            "local que pretende fazer o curso",
+            "local que pretende fazer o",
+            "local que pretende fazer curso",
+            "turma",
+        ),
+        "status": (
+            "status",
+            "status matricula",
+            "status_matricula",
+            "status sync",
+            "status_sync",
+            "situacao",
+            "acao",
+            "acao matricula",
+        ),
+        "role_id": (
+            "role id",
+            "role_id",
+            "perfil id",
+            "perfil_id",
+            "papel id",
+            "papel_id",
+        ),
+    }
+
     def __init__(
         self,
         moodle_service: MoodleService,
@@ -394,19 +455,207 @@ class SyncEngine:
         return match.group(0) if match else ""
 
     @staticmethod
-    def _normalize_header_name(value: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", str(value).lower())
+    def _normalize_text(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", str(value or ""))
+        ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+        return ascii_text.strip().lower()
 
     @staticmethod
-    def _get_field_by_alias(payload: dict[str, Any], aliases: list[str]) -> str:
-        normalized_aliases = set(aliases)
+    def _normalize_header_name(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", SyncEngine._normalize_text(value))
+
+    @staticmethod
+    def _normalize_field_token(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", SyncEngine._normalize_text(value))
+
+    @classmethod
+    def _build_alias_map(cls, canonical_fields: list[str]) -> dict[str, set[str]]:
+        alias_map: dict[str, set[str]] = {}
+        for field in canonical_fields:
+            raw_aliases = cls._INPUT_FIELD_ALIASES.get(field, ())
+            normalized_aliases = {
+                cls._normalize_header_name(alias)
+                for alias in raw_aliases
+                if cls._normalize_header_name(alias)
+            }
+            normalized_aliases.add(cls._normalize_header_name(field))
+            alias_map[field] = normalized_aliases
+        return alias_map
+
+    @staticmethod
+    def _resolve_field_name(
+        normalized_key: str,
+        alias_map: dict[str, set[str]],
+    ) -> dict[str, Any]:
+        if not normalized_key:
+            return {
+                "status": "campo_nao_reconhecido",
+                "motivo": "nao_reconhecido",
+                "campo_moodle": "",
+                "campo_moodle_sugerido": "",
+                "duvida": "",
+                "confianca": 0.0,
+            }
+
+        exact_matches = [field for field, aliases in alias_map.items() if normalized_key in aliases]
+        if len(exact_matches) == 1:
+            return {
+                "status": "mapeado",
+                "motivo": "ok",
+                "campo_moodle": exact_matches[0],
+                "campo_moodle_sugerido": "",
+                "duvida": "",
+                "confianca": 1.0,
+            }
+
+        if len(exact_matches) > 1:
+            sugestao = exact_matches[0]
+            return {
+                "status": "campo_nao_reconhecido",
+                "motivo": "ambiguidade",
+                "campo_moodle": "",
+                "campo_moodle_sugerido": sugestao,
+                "duvida": (
+                    "Campo com colisao de aliases. "
+                    f"Sugestao mais provavel: '{sugestao}'."
+                ),
+                "confianca": 1.0,
+            }
+
+        scored_candidates: list[tuple[str, float]] = []
+        for field, aliases in alias_map.items():
+            best_score = 0.0
+            for alias in aliases:
+                score = SequenceMatcher(None, normalized_key, alias).ratio()
+                if score > best_score:
+                    best_score = score
+            scored_candidates.append((field, best_score))
+
+        scored_candidates.sort(key=lambda item: item[1], reverse=True)
+        best_field, best_score = scored_candidates[0]
+        second_field, second_score = (
+            scored_candidates[1] if len(scored_candidates) > 1 else ("", 0.0)
+        )
+
+        safe_cutoff = 0.82
+        ambiguous_cutoff = 0.75
+        ambiguous_gap = 0.07
+
+        if (
+            best_score >= ambiguous_cutoff
+            and second_score >= ambiguous_cutoff
+            and abs(best_score - second_score) <= ambiguous_gap
+            and best_field != second_field
+        ):
+            return {
+                "status": "campo_nao_reconhecido",
+                "motivo": "ambiguidade",
+                "campo_moodle": "",
+                "campo_moodle_sugerido": best_field,
+                "duvida": (
+                    "Nome de coluna ambiguo entre multiplos campos. "
+                    f"Sugestao mais provavel: '{best_field}'."
+                ),
+                "confianca": round(best_score, 4),
+            }
+
+        if best_score >= safe_cutoff:
+            return {
+                "status": "mapeado",
+                "motivo": "ok",
+                "campo_moodle": best_field,
+                "campo_moodle_sugerido": "",
+                "duvida": "",
+                "confianca": round(best_score, 4),
+            }
+
+        return {
+            "status": "campo_nao_reconhecido",
+            "motivo": "nao_reconhecido",
+            "campo_moodle": "",
+            "campo_moodle_sugerido": "",
+            "duvida": "",
+            "confianca": round(best_score, 4),
+        }
+
+    @classmethod
+    def _map_row_fields(
+        cls,
+        payload: dict[str, Any],
+        *,
+        row_number: int,
+        canonical_fields: list[str],
+    ) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        mapped_values = {field: "" for field in canonical_fields}
+        mapped_confidence = {field: 0.0 for field in canonical_fields}
+        diagnostics: list[dict[str, Any]] = []
+        alias_map = cls._build_alias_map(canonical_fields)
+
         for key, value in payload.items():
             if key == "_row_number":
                 continue
-            normalized_key = SyncEngine._normalize_header_name(str(key))
-            if normalized_key in normalized_aliases and str(value).strip():
-                return str(value).strip()
-        return ""
+            raw_value = str(value or "").strip()
+            if not raw_value:
+                continue
+
+            normalized_key = cls._normalize_header_name(str(key))
+            resolution = cls._resolve_field_name(normalized_key, alias_map)
+            mapped_field = str(resolution.get("campo_moodle") or "")
+            confidence = float(resolution.get("confianca") or 0.0)
+
+            if mapped_field and confidence >= mapped_confidence.get(mapped_field, 0.0):
+                mapped_values[mapped_field] = raw_value
+                mapped_confidence[mapped_field] = confidence
+
+            diagnostics.append(
+                {
+                    "linha": row_number,
+                    "campo_entrada": str(key),
+                    "valor_original": raw_value,
+                    "status": resolution.get("status") or "campo_nao_reconhecido",
+                    "motivo": resolution.get("motivo") or "nao_reconhecido",
+                    "campo_moodle": mapped_field,
+                    "campo_moodle_sugerido": resolution.get("campo_moodle_sugerido") or "",
+                    "duvida": resolution.get("duvida") or "",
+                    "confianca": confidence,
+                },
+            )
+
+        return mapped_values, diagnostics
+
+    @staticmethod
+    def _build_field_mapping_report(diagnostics: list[dict[str, Any]]) -> dict[str, Any]:
+        totals = {
+            "total_campos_avaliados": len(diagnostics),
+            "mapeado": 0,
+            "campo_nao_reconhecido": 0,
+            "ambiguidade": 0,
+        }
+        by_row: dict[int, list[dict[str, Any]]] = {}
+
+        for item in diagnostics:
+            status = str(item.get("status") or "")
+            reason = str(item.get("motivo") or "")
+            row_number = int(item.get("linha", 0) or 0)
+            by_row.setdefault(row_number, []).append(item)
+
+            if status == "mapeado":
+                totals["mapeado"] += 1
+            elif status == "campo_nao_reconhecido":
+                totals["campo_nao_reconhecido"] += 1
+
+            if reason == "ambiguidade":
+                totals["ambiguidade"] += 1
+
+        rows = [
+            {"linha": row_number, "campos": by_row[row_number]}
+            for row_number in sorted(by_row.keys())
+        ]
+        return {
+            "schema": "normalizacao_campos_v1",
+            "totais": totals,
+            "linhas": rows,
+        }
 
     @staticmethod
     def _split_full_name(full_name: str) -> tuple[str, str]:
@@ -425,19 +674,28 @@ class SyncEngine:
         for item in rows:
             row_number = int(item.get("_row_number", 0) or 0)
             data_keys = [key for key in item.keys() if key != "_row_number"]
-            if len(data_keys) != 1:
+            compact_candidates = [
+                key
+                for key in data_keys
+                if "," in str(key or "") and "," in str(item.get(key, "") or "")
+            ]
+            if len(compact_candidates) != 1:
                 expanded.append(item)
                 continue
 
-            compact_header = str(data_keys[0] or "").strip()
-            compact_value = str(item.get(data_keys[0], "") or "").strip()
-            if "," not in compact_header or "," not in compact_value:
-                expanded.append(item)
-                continue
+            compact_key = compact_candidates[0]
+            compact_header = str(compact_key or "").strip()
+            compact_value = str(item.get(compact_key, "") or "").strip()
 
             headers = [part.strip() for part in next(csv.reader([compact_header]))]
             values = [part.strip() for part in next(csv.reader([compact_value]))]
             rebuilt: dict[str, Any] = {"_row_number": row_number}
+
+            for key in data_keys:
+                if key == compact_key:
+                    continue
+                rebuilt[str(key)] = item.get(key, "")
+
             for idx, header in enumerate(headers):
                 rebuilt[header] = values[idx] if idx < len(values) else ""
             expanded.append(rebuilt)
@@ -447,43 +705,37 @@ class SyncEngine:
     def _normalize_input_student_rows(
         rows: list[dict[str, Any]],
         default_password: str,
-    ) -> tuple[list[dict[str, Any]], list[str]]:
+        include_diagnostics: bool = False,
+    ) -> (
+        tuple[list[dict[str, Any]], list[str]]
+        | tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]
+    ):
         normalized_rows: list[dict[str, Any]] = []
         warnings: list[str] = []
+        diagnostics: list[dict[str, Any]] = []
 
         for item in rows:
             row_number = int(item.get("_row_number", 0) or 0)
-            cpf = SyncEngine._get_field_by_alias(
+            mapped_values, row_diagnostics = SyncEngine._map_row_fields(
                 item,
-                [
-                    "cpf",
-                    "username",
-                    "usuario",
-                    "moodleusername",
-                ],
+                row_number=row_number,
+                canonical_fields=["username", "email", "full_name"],
             )
-            cpf = re.sub(r"\D", "", cpf)
+            diagnostics.extend(row_diagnostics)
 
-            email = SyncEngine._get_field_by_alias(
-                item,
-                [
-                    "email",
-                    "emailobrigatoriamentegmail",
-                ],
-            ).lower()
+            cpf = re.sub(r"\D", "", mapped_values.get("username", ""))
+            if cpf and len(cpf) != 11:
+                warnings.append(f"Linha {row_number}: CPF deve conter 11 digitos.")
+
+            email = str(mapped_values.get("email", "")).strip().lower()
+            if email and not is_valid_email(email):
+                warnings.append(f"Linha {row_number}: formato de email invalido.")
             if email and not email.endswith("@gmail.com"):
                 warnings.append(
                     f"Linha {row_number}: email deve ser Gmail (@gmail.com).",
                 )
 
-            full_name = SyncEngine._get_field_by_alias(
-                item,
-                [
-                    "nomecompleto",
-                    "nome",
-                    "studentname",
-                ],
-            )
+            full_name = str(mapped_values.get("full_name", "")).strip()
             firstname, lastname = SyncEngine._split_full_name(full_name)
             if not firstname:
                 warnings.append(f"Linha {row_number}: nome completo obrigatorio.")
@@ -503,67 +755,73 @@ class SyncEngine:
                 },
             )
 
+        if include_diagnostics:
+            return normalized_rows, warnings, diagnostics
         return normalized_rows, warnings
 
     @staticmethod
     def _normalize_input_enrollment_rows(
         rows: list[dict[str, Any]],
         fallback_course_id: int,
-    ) -> list[dict[str, Any]]:
+        include_diagnostics: bool = False,
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
         normalized_rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        diagnostics: list[dict[str, Any]] = []
         for item in rows:
             row_number = int(item.get("_row_number", 0) or 0)
-            cpf = SyncEngine._get_field_by_alias(
+            mapped_values, row_diagnostics = SyncEngine._map_row_fields(
                 item,
-                [
-                    "cpf",
-                    "username",
-                    "usuario",
-                    "moodleusername",
-                ],
+                row_number=row_number,
+                canonical_fields=["username", "email", "course_id", "status", "role_id"],
             )
-            cpf = re.sub(r"\D", "", cpf)
-            email = SyncEngine._get_field_by_alias(
-                item,
-                [
-                    "email",
-                    "emailobrigatoriamentegmail",
-                ],
-            ).lower()
-            course_id = SyncEngine._get_field_by_alias(
-                item,
-                [
-                    "cursoid",
-                    "courseid",
-                    "curso",
-                    "localquepretendefazero curso",
-                    "localquepretendefazero",
-                    "localquepretendefazerocurso",
-                ],
-            )
+            diagnostics.extend(row_diagnostics)
+
+            cpf = re.sub(r"\D", "", mapped_values.get("username", ""))
+            if cpf and len(cpf) != 11:
+                warnings.append(f"Linha {row_number}: CPF deve conter 11 digitos.")
+
+            email = str(mapped_values.get("email", "")).strip().lower()
+            if email and not is_valid_email(email):
+                warnings.append(f"Linha {row_number}: formato de email invalido.")
+
+            course_id_raw = str(mapped_values.get("course_id", "")).strip()
+            course_id = course_id_raw
             course_id = SyncEngine._extract_first_number(course_id) if course_id else ""
+            if course_id_raw and not course_id:
+                warnings.append(
+                    f"Linha {row_number}: formato de course_id invalido. Use um numero de curso.",
+                )
             if not course_id:
                 course_id = str(fallback_course_id)
 
-            status_text = SyncEngine._get_field_by_alias(
-                item,
-                ["status", "statusmatricula", "statussync", "situacao"],
-            ).strip().lower()
+            status_text = SyncEngine._normalize_field_token(str(mapped_values.get("status", "")))
             action = "enroll"
-            if status_text in {"suspenso", "suspend", "suspended"}:
+            if status_text in {"suspenso", "suspend", "suspended", "suspender"}:
                 action = "suspend"
-            if status_text in {"desmatricular", "remove", "unenroll"}:
+            if status_text in {"desmatricular", "remove", "unenroll", "cancelar"}:
                 action = "unenroll"
 
-            normalized_rows.append(
-                {
-                    "_row_number": row_number,
-                    "username": cpf,
-                    "email": email,
-                    "course_id": course_id,
-                    "action": action,
-                },
-            )
+            role_id_raw = str(mapped_values.get("role_id", "")).strip()
+            role_id = SyncEngine._extract_first_number(role_id_raw) if role_id_raw else ""
+            if role_id_raw and not role_id:
+                warnings.append(
+                    f"Linha {row_number}: formato de role_id invalido. Use um numero de papel.",
+                )
+
+            enrollment_row = {
+                "_row_number": row_number,
+                "username": cpf,
+                "email": email,
+                "course_id": course_id,
+                "action": action,
+            }
+            if role_id:
+                enrollment_row["role_id"] = role_id
+            normalized_rows.append(enrollment_row)
+
+        if include_diagnostics:
+            return normalized_rows, warnings, diagnostics
         return normalized_rows
 
     async def _append_sync_event(self, summary: SyncRunSummary, status: str) -> None:
@@ -628,8 +886,16 @@ class SyncEngine:
 
     async def sync_moodle_to_sheets(self, request: MoodleToSheetsRequest) -> SyncRunSummary:
         started_at = datetime.now(UTC)
-        course_ids = await self.moodle_service.list_course_ids(request.scope.course_ids)
         warnings: list[str] = []
+        requested_course_ids = sorted(set(request.scope.course_ids or []))
+        try:
+            course_ids = await self.moodle_service.list_course_ids(request.scope.course_ids)
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError) as exc:
+            warnings.append(f"Falha ao listar cursos no Moodle: {exc}")
+            course_ids = requested_course_ids
+
+        if not course_ids and requested_course_ids:
+            course_ids = requested_course_ids
 
         dataset: dict[str, list[dict[str, Any]]] = {
             "courses": [],
@@ -650,20 +916,29 @@ class SyncEngine:
         }
 
         course_name_map: dict[int, str] = {}
+        catalog_collected = False
         if request.scope.include_course_catalog:
-            catalog_rows, catalog_warnings = await self.moodle_service.collect_catalog(course_ids)
-            warnings.extend(catalog_warnings)
-            dataset["courses"].extend(catalog_rows.get("courses", []))
-            dataset["categories"].extend(catalog_rows.get("categories", []))
-            dataset["course_contents"].extend(catalog_rows.get("course_contents", []))
-            for item in catalog_rows.get("courses", []):
-                if item.get("course_id"):
-                    course_name_map[int(item["course_id"])] = str(item.get("fullname") or item.get("shortname") or item["course_id"])
+            try:
+                catalog_rows, catalog_warnings = await self.moodle_service.collect_catalog(course_ids)
+                catalog_collected = True
+                warnings.extend(catalog_warnings)
+                dataset["courses"].extend(catalog_rows.get("courses", []))
+                dataset["categories"].extend(catalog_rows.get("categories", []))
+                dataset["course_contents"].extend(catalog_rows.get("course_contents", []))
+                for item in catalog_rows.get("courses", []):
+                    if item.get("course_id"):
+                        course_name_map[int(item["course_id"])] = str(item.get("fullname") or item.get("shortname") or item["course_id"])
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError) as exc:
+                warnings.append(f"Falha ao coletar catalogo de cursos no Moodle: {exc}")
 
         per_course_metrics: dict[int, dict[str, list[dict[str, Any]]]] = {}
         for course_id in course_ids:
             logger.info("Coletando metricas do curso {}", course_id)
-            rows, row_warnings = await self.moodle_service.collect_course_metrics(course_id, request.scope)
+            try:
+                rows, row_warnings = await self.moodle_service.collect_course_metrics(course_id, request.scope)
+            except (MoodleAuthError, MoodleAPIError, MoodleConnectionError) as exc:
+                warnings.append(f"Falha ao coletar metricas do curso {course_id}: {exc}")
+                continue
             per_course_metrics[course_id] = rows
             warnings.extend(row_warnings)
             for key in dataset.keys():
@@ -671,47 +946,77 @@ class SyncEngine:
 
         counts: dict[str, int] = {}
 
-        courses_result = await self._run_sheet("upsert_records", self.courses_sheet, dataset["courses"], ["course_id"])
-        categories_result = await self._run_sheet(
-            "upsert_records",
-            self.categories_sheet,
-            dataset["categories"],
-            ["category_id"],
-        )
-        course_contents_count = await self._run_sheet("overwrite_records", self.course_contents_sheet, dataset["course_contents"])
+        if catalog_collected:
+            courses_result = await self._run_sheet("upsert_records", self.courses_sheet, dataset["courses"], ["course_id"])
+            categories_result = await self._run_sheet(
+                "upsert_records",
+                self.categories_sheet,
+                dataset["categories"],
+                ["category_id"],
+            )
+            course_contents_count = await self._run_sheet("overwrite_records", self.course_contents_sheet, dataset["course_contents"])
+            counts["courses_inserted"] = courses_result["inserted"]
+            counts["courses_updated"] = courses_result["updated"]
+            counts["categories_inserted"] = categories_result["inserted"]
+            counts["categories_updated"] = categories_result["updated"]
+            counts["course_contents"] = course_contents_count
+        elif request.scope.include_course_catalog:
+            warnings.append("Catalogo Moodle nao sincronizado por falta de permissao ou indisponibilidade.")
 
-        students_result = await self._run_sheet("upsert_records", self.students_sheet, dataset["students"], ["user_id"])
-        enrollments_result = await self._run_sheet(
-            "upsert_records",
-            self.enrollments_sheet,
-            dataset["enrollments"],
-            ["course_id", "user_id"],
-        )
-        groups_result = await self._run_sheet("upsert_records", self.groups_sheet, dataset["groups"], ["course_id", "group_id"])
-        group_members_result = await self._run_sheet(
-            "upsert_records",
-            self.group_members_sheet,
-            dataset["group_members"],
-            ["course_id", "group_id", "user_id"],
-        )
-        groupings_result = await self._run_sheet(
-            "upsert_records",
-            self.groupings_sheet,
-            dataset["groupings"],
-            ["course_id", "grouping_id"],
-        )
+        if per_course_metrics:
+            students_result = await self._run_sheet("upsert_records", self.students_sheet, dataset["students"], ["user_id"])
+            enrollments_result = await self._run_sheet(
+                "upsert_records",
+                self.enrollments_sheet,
+                dataset["enrollments"],
+                ["course_id", "user_id"],
+            )
+            groups_result = await self._run_sheet("upsert_records", self.groups_sheet, dataset["groups"], ["course_id", "group_id"])
+            group_members_result = await self._run_sheet(
+                "upsert_records",
+                self.group_members_sheet,
+                dataset["group_members"],
+                ["course_id", "group_id", "user_id"],
+            )
+            groupings_result = await self._run_sheet(
+                "upsert_records",
+                self.groupings_sheet,
+                dataset["groupings"],
+                ["course_id", "grouping_id"],
+            )
 
-        grades_count = await self._run_sheet("overwrite_records", self.grades_sheet, dataset["grades"])
-        completion_count = await self._run_sheet("overwrite_records", self.completion_sheet, dataset["completion"])
-        progress_count = await self._run_sheet("overwrite_records", self.progress_sheet, dataset["progress"])
-        logs_count = await self._run_sheet("overwrite_records", self.logs_sheet, dataset["logs"])
-        badges_count = await self._run_sheet("overwrite_records", self.badges_sheet, dataset["badges"])
-        competencies_count = await self._run_sheet("overwrite_records", self.competencies_sheet, dataset["competencies"])
-        custom_metrics_count = await self._run_sheet(
-            "overwrite_records",
-            self.custom_metrics_sheet,
-            dataset["custom_metrics"],
-        )
+            grades_count = await self._run_sheet("overwrite_records", self.grades_sheet, dataset["grades"])
+            completion_count = await self._run_sheet("overwrite_records", self.completion_sheet, dataset["completion"])
+            progress_count = await self._run_sheet("overwrite_records", self.progress_sheet, dataset["progress"])
+            logs_count = await self._run_sheet("overwrite_records", self.logs_sheet, dataset["logs"])
+            badges_count = await self._run_sheet("overwrite_records", self.badges_sheet, dataset["badges"])
+            competencies_count = await self._run_sheet("overwrite_records", self.competencies_sheet, dataset["competencies"])
+            custom_metrics_count = await self._run_sheet(
+                "overwrite_records",
+                self.custom_metrics_sheet,
+                dataset["custom_metrics"],
+            )
+
+            counts["students_inserted"] = students_result["inserted"]
+            counts["students_updated"] = students_result["updated"]
+            counts["enrollments_inserted"] = enrollments_result["inserted"]
+            counts["enrollments_updated"] = enrollments_result["updated"]
+            counts["groups_inserted"] = groups_result["inserted"]
+            counts["groups_updated"] = groups_result["updated"]
+            counts["group_members_inserted"] = group_members_result["inserted"]
+            counts["group_members_updated"] = group_members_result["updated"]
+            counts["groupings_inserted"] = groupings_result["inserted"]
+            counts["groupings_updated"] = groupings_result["updated"]
+
+            counts["grades"] = grades_count
+            counts["completion"] = completion_count
+            counts["progress"] = progress_count
+            counts["logs"] = logs_count
+            counts["badges"] = badges_count
+            counts["competencies"] = competencies_count
+            counts["custom_metrics"] = custom_metrics_count
+        else:
+            warnings.append("Nenhum curso foi sincronizado do Moodle; dados existentes em planilhas foram preservados.")
 
         base_headers = ALUNOS_BASE_HEADERS
         for course_id, course_rows in per_course_metrics.items():
@@ -738,30 +1043,32 @@ class SyncEngine:
                 detailed_rows,
             )
 
-        counts["courses_inserted"] = courses_result["inserted"]
-        counts["courses_updated"] = courses_result["updated"]
-        counts["categories_inserted"] = categories_result["inserted"]
-        counts["categories_updated"] = categories_result["updated"]
-        counts["course_contents"] = course_contents_count
-
-        counts["students_inserted"] = students_result["inserted"]
-        counts["students_updated"] = students_result["updated"]
-        counts["enrollments_inserted"] = enrollments_result["inserted"]
-        counts["enrollments_updated"] = enrollments_result["updated"]
-        counts["groups_inserted"] = groups_result["inserted"]
-        counts["groups_updated"] = groups_result["updated"]
-        counts["group_members_inserted"] = group_members_result["inserted"]
-        counts["group_members_updated"] = group_members_result["updated"]
-        counts["groupings_inserted"] = groupings_result["inserted"]
-        counts["groupings_updated"] = groupings_result["updated"]
-
-        counts["grades"] = grades_count
-        counts["completion"] = completion_count
-        counts["progress"] = progress_count
-        counts["logs"] = logs_count
-        counts["badges"] = badges_count
-        counts["competencies"] = competencies_count
-        counts["custom_metrics"] = custom_metrics_count
+        expected_count_keys = (
+            "courses_inserted",
+            "courses_updated",
+            "categories_inserted",
+            "categories_updated",
+            "course_contents",
+            "students_inserted",
+            "students_updated",
+            "enrollments_inserted",
+            "enrollments_updated",
+            "groups_inserted",
+            "groups_updated",
+            "group_members_inserted",
+            "group_members_updated",
+            "groupings_inserted",
+            "groupings_updated",
+            "grades",
+            "completion",
+            "progress",
+            "logs",
+            "badges",
+            "competencies",
+            "custom_metrics",
+        )
+        for key in expected_count_keys:
+            counts.setdefault(key, 0)
 
         finished_at = datetime.now(UTC)
         self.state.set_datetime("moodle_to_sheets", finished_at)
@@ -836,28 +1143,83 @@ class SyncEngine:
         counts: dict[str, int] = {}
 
         if request.process_students:
-            student_rows = await self._run_sheet("read_records_with_row_number", students_input_sheet)
-            result_counts, row_warnings, processed_rows = await self.moodle_service.apply_students_rows(
-                student_rows,
-                dry_run=request.dry_run,
-            )
-            warnings.extend(row_warnings)
-            counts.update(result_counts)
+            student_rows: list[dict[str, Any]] = []
+            try:
+                student_rows = await self._run_sheet("read_records_with_row_number", students_input_sheet)
+            except SheetsSyncError as exc:
+                warnings.append(
+                    f"Falha ao ler aba de alunos '{students_input_sheet}': {exc}",
+                )
+
+            if student_rows:
+                try:
+                    result_counts, row_warnings, processed_rows = await self.moodle_service.apply_students_rows(
+                        student_rows,
+                        dry_run=request.dry_run,
+                    )
+                except (MoodleAuthError, MoodleAPIError, MoodleConnectionError) as exc:
+                    result_counts = {"created": 0, "updated": 0}
+                    processed_rows = []
+                    row_warnings = [
+                        (
+                            f"Linha {int(row.get('_row_number', 0) or 0)}: "
+                            f"falha ao processar aluno no AVA ({exc})."
+                        )
+                        for row in student_rows
+                    ]
+
+                warnings.extend(row_warnings)
+                counts.update(result_counts)
+                if request.clear_processed_rows and processed_rows and not request.dry_run:
+                    try:
+                        await self._run_sheet("clear_rows", students_input_sheet, processed_rows)
+                    except SheetsSyncError as exc:
+                        warnings.append(
+                            f"Falha ao limpar linhas processadas da aba '{students_input_sheet}': {exc}",
+                        )
+
             counts["students_input_rows"] = len(student_rows)
-            if request.clear_processed_rows and processed_rows and not request.dry_run:
-                await self._run_sheet("clear_rows", students_input_sheet, processed_rows)
 
         if request.process_enrollments:
-            enrollment_rows = await self._run_sheet("read_records_with_row_number", enrollments_input_sheet)
-            result_counts, row_warnings, processed_rows = await self.moodle_service.apply_enrollment_rows(
-                enrollment_rows,
-                dry_run=request.dry_run,
-            )
-            warnings.extend(row_warnings)
-            counts.update(result_counts)
+            enrollment_rows: list[dict[str, Any]] = []
+            try:
+                enrollment_rows = await self._run_sheet(
+                    "read_records_with_row_number",
+                    enrollments_input_sheet,
+                )
+            except SheetsSyncError as exc:
+                warnings.append(
+                    f"Falha ao ler aba de matriculas '{enrollments_input_sheet}': {exc}",
+                )
+
+            if enrollment_rows:
+                try:
+                    result_counts, row_warnings, processed_rows = await self.moodle_service.apply_enrollment_rows(
+                        enrollment_rows,
+                        dry_run=request.dry_run,
+                    )
+                except (MoodleAuthError, MoodleAPIError, MoodleConnectionError) as exc:
+                    result_counts = {"enrolled": 0, "suspended": 0, "unenrolled": 0}
+                    processed_rows = []
+                    row_warnings = [
+                        (
+                            f"Linha {int(row.get('_row_number', 0) or 0)}: "
+                            f"falha ao matricular no AVA ({exc})."
+                        )
+                        for row in enrollment_rows
+                    ]
+
+                warnings.extend(row_warnings)
+                counts.update(result_counts)
+                if request.clear_processed_rows and processed_rows and not request.dry_run:
+                    try:
+                        await self._run_sheet("clear_rows", enrollments_input_sheet, processed_rows)
+                    except SheetsSyncError as exc:
+                        warnings.append(
+                            f"Falha ao limpar linhas processadas da aba '{enrollments_input_sheet}': {exc}",
+                        )
+
             counts["enrollments_input_rows"] = len(enrollment_rows)
-            if request.clear_processed_rows and processed_rows and not request.dry_run:
-                await self._run_sheet("clear_rows", enrollments_input_sheet, processed_rows)
 
         finished_at = datetime.now(UTC)
         self.state.set_datetime("sheets_to_moodle", finished_at)
@@ -897,7 +1259,10 @@ class SyncEngine:
             summary.duration_seconds,
         )
 
-        await self._append_sync_event(summary, "partial" if summary.warnings else "success")
+        try:
+            await self._append_sync_event(summary, "partial" if summary.warnings else "success")
+        except SheetsSyncError as exc:
+            logger.warning("Falha ao registrar evento de sync sheets_to_moodle: {}", exc)
         return summary
 
     async def sync_course_full(self, course_id: int, triggered_by: str = "api") -> SyncRunSummary:
@@ -944,20 +1309,37 @@ class SyncEngine:
         course_id: int,
         dry_run: bool = False,
     ) -> SyncRunSummary:
-        input_rows = await self._run_sheet("read_records_with_row_number", sheet_name)
-        input_rows = self._expand_compact_csv_rows(input_rows)
         started_at = datetime.now(UTC)
+        input_rows: list[dict[str, Any]] = []
+        input_warnings: list[str] = []
+        try:
+            input_rows = await self._run_sheet("read_records_with_row_number", sheet_name)
+            input_rows = self._expand_compact_csv_rows(input_rows)
+        except SheetsSyncError as exc:
+            input_warnings.append(f"Falha ao ler aba '{sheet_name}': {exc}")
+
         default_password = str(
             getattr(self.moodle_service.settings, "moodle_default_new_user_password", "") or "",
         )
 
-        students_rows, students_input_warnings = self._normalize_input_student_rows(
+        students_rows, students_input_warnings, students_input_diagnostics = self._normalize_input_student_rows(
             input_rows,
             default_password=default_password,
+            include_diagnostics=True,
         )
-        enrollment_rows = self._normalize_input_enrollment_rows(
-            input_rows,
-            fallback_course_id=course_id,
+        enrollment_rows, enrollment_input_warnings, enrollment_input_diagnostics = (
+            self._normalize_input_enrollment_rows(
+                input_rows,
+                fallback_course_id=course_id,
+                include_diagnostics=True,
+            )
+        )
+
+        mapping_report = self._build_field_mapping_report(
+            [
+                *students_input_diagnostics,
+                *enrollment_input_diagnostics,
+            ],
         )
 
         student_counts, student_warnings, student_processed_rows = await self.moodle_service.apply_students_rows(
@@ -976,14 +1358,24 @@ class SyncEngine:
             if row_number in student_processed_set and not has_input_warning and not has_student_warning:
                 eligible_enrollment_rows.append(row)
 
-        enroll_counts, enroll_warnings, enroll_processed_rows = await self.moodle_service.apply_enrollment_rows(
-            eligible_enrollment_rows,
-            dry_run=dry_run,
-        )
+        try:
+            enroll_counts, enroll_warnings, enroll_processed_rows = await self.moodle_service.apply_enrollment_rows(
+                eligible_enrollment_rows,
+                dry_run=dry_run,
+            )
+        except (MoodleAuthError, MoodleAPIError, MoodleConnectionError) as exc:
+            enroll_counts = {"enrolled": 0, "suspended": 0, "unenrolled": 0}
+            enroll_processed_rows = []
+            enroll_warnings = [
+                f"Linha {int(row.get('_row_number', 0) or 0)}: falha ao matricular no AVA ({exc})."
+                for row in eligible_enrollment_rows
+            ]
         enroll_processed_set = set(enroll_processed_rows)
 
         warnings = [
+            *input_warnings,
             *students_input_warnings,
+            *enrollment_input_warnings,
             *student_warnings,
             *enroll_warnings,
         ]
@@ -1013,7 +1405,10 @@ class SyncEngine:
                 )
             else:
                 updates.append({"row_number": row_number, "status": "erro", "error": "Linha nao processada"})
-        await self._run_sheet("update_sync_status_rows", sheet_name, updates)
+        try:
+            await self._run_sheet("update_sync_status_rows", sheet_name, updates)
+        except SheetsSyncError as exc:
+            warnings.append(f"Falha ao atualizar status por linha na aba '{sheet_name}': {exc}")
         finished_at = datetime.now(UTC)
 
         rows_failed = sum(1 for row in enrollment_rows if warnings_by_row.get(int(row.get("_row_number", 0) or 0)))
@@ -1035,7 +1430,12 @@ class SyncEngine:
             duration_seconds=(finished_at - started_at).total_seconds(),
             processed_counts=counts,
             warnings=warnings,
-            extra={"sheet_name": sheet_name, "course_id": course_id, "dry_run": dry_run},
+            extra={
+                "sheet_name": sheet_name,
+                "course_id": course_id,
+                "dry_run": dry_run,
+                "normalizacao_campos": mapping_report,
+            },
         )
 
         self.state.add_sync_log(
@@ -1060,7 +1460,10 @@ class SyncEngine:
             summary.duration_seconds,
         )
 
-        await self._append_sync_event(summary, "partial" if summary.warnings else "success")
+        try:
+            await self._append_sync_event(summary, "partial" if summary.warnings else "success")
+        except SheetsSyncError as exc:
+            logger.warning("Falha ao registrar evento de sync_sheet_to_moodle_enroll: {}", exc)
         return summary
 
     async def sync_bidirectional(
