@@ -65,11 +65,18 @@ export interface GoogleSheetsOAuthStartResponse {
 }
 
 export interface GoogleSheetsConfigResponse {
+  integration_mode: 'oauth' | 'apps_script'
   oauth: {
     configured: boolean
     client_id_masked: string
     redirect_uri: string
     refresh_token_configured: boolean
+  }
+  apps_script: {
+    configured: boolean
+    webhook_url: string
+    webhook_token_configured: boolean
+    timeout_seconds: number
   }
   spreadsheet: {
     id: string
@@ -87,16 +94,29 @@ export interface GoogleSheetsConfigPayload {
 export interface GoogleSheetsConfigSaveResponse {
   ok: boolean
   message: string
+  integration_mode: 'oauth' | 'apps_script'
   oauth: {
     configured: boolean
     redirect_uri: string
     refresh_token_configured: boolean
+  }
+  apps_script?: {
+    configured: boolean
+    webhook_url: string
+    webhook_token_configured: boolean
+    timeout_seconds: number
   }
   spreadsheet: {
     id: string
     url: string
   }
   sheets_runtime_status: 'online' | 'offline'
+}
+
+export interface GoogleSheetsAppsScriptConfigPayload {
+  spreadsheet: string
+  webhook_url: string
+  webhook_token?: string
 }
 
 export interface DriveToMoodleSyncResponse {

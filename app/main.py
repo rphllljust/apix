@@ -43,6 +43,7 @@ from app.exceptions import (
 from app.models.schemas import (
     BidirectionalRequest,
     DriveToMoodleRequest,
+    GoogleSheetsAppsScriptConfigRequest,
     GoogleSheetsOAuthConfigRequest,
     MoodleTokenConfigRequest,
     MoodleToSheetsRequest,
@@ -91,7 +92,7 @@ def _bootstrap_cors_origins() -> list[str]:
         seen.add(normalized)
         expanded.append(normalized)
 
-    dev_ports = (3000, 4173, 5173, 5174, 5180)
+    dev_ports = (3000, 4173, 5173, 5174, 5180, 5190)
     for origin in base_items:
         add_origin(origin)
         parsed = urlparse(origin)
@@ -282,6 +283,20 @@ def _validate_google_redirect_uri(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("Redirect URI invalido. Use URL completa iniciando com http:// ou https://.")
     return redirect_uri
+
+
+def _validate_google_apps_script_webhook_url(value: str) -> str:
+    webhook_url = str(value or "").strip()
+    if not webhook_url:
+        raise ValueError("Informe a URL do Web App do Apps Script.")
+    parsed = urlparse(webhook_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("URL do Apps Script invalida. Use URL completa iniciando com http:// ou https://.")
+    if "script.google.com" not in parsed.netloc:
+        raise ValueError("A URL informada nao parece ser um Web App do Google Apps Script.")
+    if "/exec" not in parsed.path:
+        raise ValueError("A URL do Web App deve terminar com '/exec'.")
+    return webhook_url
 
 
 def _mask_secret(value: str) -> str:
@@ -721,23 +736,10 @@ async def health(request: Request) -> dict[str, Any]:
         else:
             sheets_ok = bool(await asyncio.to_thread(lambda: GoogleSheetsClient(settings).ping()))
         sheets_status = "online" if sheets_ok else "offline"
-        if not sheets_ok:
-            _persist_error_log(
-                request=request,
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                error_code="sheets_connection_error",
-                message="Google Sheets indisponivel no health check.",
-                details={},
-            )
     except Exception as exc:
+        # Tolerate Google Sheets connection issues - it's optional for monitoring
         sheets_status = "offline"
-        _persist_error_log(
-            request=request,
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            error_code="sheets_connection_error",
-            message="Falha de conectividade com Google Sheets.",
-            details={"reason": str(exc)},
-        )
+        logger.debug(f"Google Sheets health check falhou (esperado se nao configurado): {exc}")
 
     return {
         "moodle": moodle_payload,
@@ -752,6 +754,8 @@ async def health(request: Request) -> dict[str, Any]:
 async def get_google_sheets_config(request: Request) -> dict[str, Any]:
     settings: Settings = getattr(request.app.state, "settings", None) or _reload_settings()
     spreadsheet_id = str(settings.google_spreadsheet_id or "").strip()
+    apps_script_url = str(settings.google_apps_script_webhook_url or "").strip()
+    integration_mode = "apps_script" if apps_script_url else "oauth"
     spreadsheet_url = (
         f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit"
         if spreadsheet_id
@@ -766,10 +770,17 @@ async def get_google_sheets_config(request: Request) -> dict[str, Any]:
             "redirect_uri": settings.google_oauth_redirect_uri,
             "refresh_token_configured": bool(settings.google_oauth_refresh_token),
         },
+        "apps_script": {
+            "configured": bool(apps_script_url),
+            "webhook_url": apps_script_url,
+            "webhook_token_configured": bool(str(settings.google_apps_script_webhook_token or "").strip()),
+            "timeout_seconds": float(settings.google_apps_script_timeout_seconds or 20.0),
+        },
         "spreadsheet": {
             "id": spreadsheet_id,
             "url": spreadsheet_url,
         },
+        "integration_mode": integration_mode,
     }
 
 
@@ -855,6 +866,71 @@ async def configure_google_sheets(
             "id": spreadsheet_id,
             "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
         },
+        "integration_mode": "oauth",
+        "sheets_runtime_status": sheets_status,
+    }
+
+
+@app.post("/api/v1/config/google-sheets/apps-script", dependencies=[Depends(require_authenticated)])
+async def configure_google_sheets_apps_script(
+    payload: GoogleSheetsAppsScriptConfigRequest,
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        spreadsheet_id = _extract_google_spreadsheet_id(payload.spreadsheet)
+        webhook_url = _validate_google_apps_script_webhook_url(payload.webhook_url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    webhook_token = str(payload.webhook_token or "").strip()
+    env_updates = {
+        "SPREADSHEET_ID": spreadsheet_id,
+        "GOOGLE_SPREADSHEET_ID": spreadsheet_id,
+        "GOOGLE_APPS_SCRIPT_WEBHOOK_URL": webhook_url,
+        "GOOGLE_APPS_SCRIPT_WEBHOOK_TOKEN": webhook_token,
+        "GOOGLE_OAUTH_REFRESH_TOKEN": "",
+    }
+
+    new_settings = await _apply_runtime_env_updates(request, env_updates)
+
+    sync_engine: SyncEngine | None = getattr(request.app.state, "sync_engine", None)
+    sheets_status = "offline"
+    try:
+        if sync_engine is not None and getattr(sync_engine, "sheets", None) is not None:
+            sheets_ok = bool(await asyncio.to_thread(sync_engine.sheets.ping))
+            sheets_status = "online" if sheets_ok else "offline"
+    except Exception:
+        sheets_status = "offline"
+
+    return {
+        "ok": True,
+        "message": (
+            "Configuracao do Apps Script salva com sucesso. "
+            "Nao e necessario Google Cloud para este modo."
+        ),
+        "oauth": {
+            "configured": bool(
+                new_settings.google_oauth_client_id and new_settings.google_oauth_client_secret,
+            ),
+            "redirect_uri": new_settings.google_oauth_redirect_uri,
+            "refresh_token_configured": bool(new_settings.google_oauth_refresh_token),
+        },
+        "apps_script": {
+            "configured": bool(str(new_settings.google_apps_script_webhook_url or "").strip()),
+            "webhook_url": str(new_settings.google_apps_script_webhook_url or "").strip(),
+            "webhook_token_configured": bool(
+                str(new_settings.google_apps_script_webhook_token or "").strip(),
+            ),
+            "timeout_seconds": float(new_settings.google_apps_script_timeout_seconds or 20.0),
+        },
+        "spreadsheet": {
+            "id": spreadsheet_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+        },
+        "integration_mode": "apps_script",
         "sheets_runtime_status": sheets_status,
     }
 
@@ -1074,6 +1150,22 @@ async def sync_course_enrollments(course_id: int, sync_engine: SyncEngine = Depe
     return await sync_engine.sync_course_enrollments(course_id)
 
 
+@app.post(
+    "/api/v1/sync/course/{course_id}/enrollments-from-sheet",
+    dependencies=[Depends(require_authenticated)],
+)
+async def sync_course_enrollments_from_sheet(
+    course_id: int,
+    sync_engine: SyncEngine = Depends(get_sync_engine),
+    settings: Settings = Depends(get_settings),
+) -> Any:
+    return await sync_engine.sync_sheet_to_moodle_enroll(
+        sheet_name=settings.google_enrollments_input_sheet,
+        course_id=course_id,
+        dry_run=False,
+    )
+
+
 @app.post("/api/v1/sync/sheets-to-moodle/enroll", dependencies=[Depends(require_authenticated)])
 async def sync_sheets_to_moodle_enroll(
     payload: SheetsEnrollRequest,
@@ -1175,4 +1267,3 @@ async def get_sync_log(sync_id: str, sync_engine: SyncEngine = Depends(get_sync_
     if not result:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sync_id nao encontrado.")
     return result
-

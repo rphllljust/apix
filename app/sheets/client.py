@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from html import unescape
 from datetime import date, datetime
 from typing import Any
 
@@ -42,6 +43,17 @@ def _serialize(value: Any) -> str:
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False)
     return str(value)
+
+
+def _extract_apps_script_html_error(raw_html: str) -> str:
+    clean_text = re.sub(r"<[^>]+>", " ", str(raw_html or ""))
+    clean_text = unescape(re.sub(r"\s+", " ", clean_text)).strip()
+    match = re.search(r"Fun[cç][aã]o de script n[aã]o encontrada:\s*([A-Za-z0-9_]+)", clean_text)
+    if match:
+        return f"Funcao de script nao encontrada: {match.group(1)}."
+    if clean_text:
+        return clean_text[:220]
+    return ""
 
 
 class GoogleSheetsClient:
@@ -112,8 +124,19 @@ class GoogleSheetsClient:
                 json=body,
                 timeout=float(self.settings.google_apps_script_timeout_seconds or 20.0),
                 headers={"Content-Type": "application/json"},
+                follow_redirects=True,
             )
             response.raise_for_status()
+            content_type = str(response.headers.get("content-type") or "").lower()
+            if "application/json" not in content_type:
+                html_error = _extract_apps_script_html_error(response.text)
+                if html_error:
+                    raise SheetsSyncError(
+                        f"Apps Script retornou resposta invalida em '{action}': {html_error}",
+                    )
+                raise SheetsSyncError(
+                    f"Apps Script retornou resposta nao JSON em '{action}'.",
+                )
             data = response.json()
         except httpx.HTTPError as exc:
             raise SheetsSyncError(

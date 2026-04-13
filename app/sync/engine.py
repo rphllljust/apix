@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import re
 from datetime import UTC, date, datetime
 from typing import Any
@@ -416,6 +417,31 @@ class SyncEngine:
         if len(parts) == 1:
             return parts[0], "-"
         return parts[0], " ".join(parts[1:])
+
+    @staticmethod
+    def _expand_compact_csv_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Converte linhas coladas como CSV em uma celula para colunas normais."""
+        expanded: list[dict[str, Any]] = []
+        for item in rows:
+            row_number = int(item.get("_row_number", 0) or 0)
+            data_keys = [key for key in item.keys() if key != "_row_number"]
+            if len(data_keys) != 1:
+                expanded.append(item)
+                continue
+
+            compact_header = str(data_keys[0] or "").strip()
+            compact_value = str(item.get(data_keys[0], "") or "").strip()
+            if "," not in compact_header or "," not in compact_value:
+                expanded.append(item)
+                continue
+
+            headers = [part.strip() for part in next(csv.reader([compact_header]))]
+            values = [part.strip() for part in next(csv.reader([compact_value]))]
+            rebuilt: dict[str, Any] = {"_row_number": row_number}
+            for idx, header in enumerate(headers):
+                rebuilt[header] = values[idx] if idx < len(values) else ""
+            expanded.append(rebuilt)
+        return expanded
 
     @staticmethod
     def _normalize_input_student_rows(
@@ -919,6 +945,7 @@ class SyncEngine:
         dry_run: bool = False,
     ) -> SyncRunSummary:
         input_rows = await self._run_sheet("read_records_with_row_number", sheet_name)
+        input_rows = self._expand_compact_csv_rows(input_rows)
         started_at = datetime.now(UTC)
         default_password = str(
             getattr(self.moodle_service.settings, "moodle_default_new_user_password", "") or "",
@@ -1191,5 +1218,3 @@ class SyncEngine:
 
 # Backward compatibility alias
 SyncService = SyncEngine
-
-

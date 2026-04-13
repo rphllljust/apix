@@ -3,6 +3,7 @@ import axiosRetry from 'axios-retry'
 import type {
   CourseItem,
   DriveToMoodleSyncResponse,
+  GoogleSheetsAppsScriptConfigPayload,
   GoogleSheetsConfigPayload,
   GoogleSheetsConfigResponse,
   GoogleSheetsConfigSaveResponse,
@@ -13,19 +14,45 @@ import type {
   SyncSummaryResponse,
 } from '@/types/api'
 
-function resolveApiBaseUrl(): string {
-  const envBaseUrl = String(import.meta.env.VITE_API_BASE_URL ?? '').trim()
-  if (envBaseUrl) {
-    return envBaseUrl
-  }
-  if (typeof window !== 'undefined' && window.location?.hostname) {
-    return `${window.location.protocol}//${window.location.hostname}:8000`
-  }
-  return 'http://localhost:8000'
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1'])
+
+function isLocalHostname(hostname: string): boolean {
+  return LOCAL_HOSTNAMES.has(String(hostname || '').trim().toLowerCase())
 }
 
-const baseURL = resolveApiBaseUrl()
+function resolveApiBaseUrl(): string {
+  const envBaseUrl = String(import.meta.env.VITE_API_BASE_URL ?? '').trim()
+  if (!envBaseUrl) {
+    if (typeof window !== 'undefined' && window.location?.hostname) {
+      return `${window.location.protocol}//${window.location.hostname}:8000`
+    }
+    return 'http://localhost:8000'
+  }
+
+  if (envBaseUrl.startsWith('/')) {
+    return envBaseUrl
+  }
+
+  if (typeof window !== 'undefined' && window.location?.hostname) {
+    try {
+      const parsed = new URL(envBaseUrl)
+      const currentHost = window.location.hostname
+      if (isLocalHostname(parsed.hostname) && !isLocalHostname(currentHost)) {
+        const port = parsed.port || '8000'
+        return `${window.location.protocol}//${currentHost}:${port}`
+      }
+    } catch {
+      return envBaseUrl
+    }
+  }
+
+  return envBaseUrl
+}
+
+export const resolvedApiBaseUrl = resolveApiBaseUrl()
+const baseURL = resolvedApiBaseUrl
 const apiKey = import.meta.env.VITE_API_KEY ?? ''
+const SYNC_REQUEST_TIMEOUT_MS = 180000
 
 export const api = axios.create({
   baseURL,
@@ -141,8 +168,19 @@ export async function triggerCourseSync(
   courseId: number,
   mode: 'full' | 'grades' | 'enrollments',
 ): Promise<SyncSummaryResponse> {
+  if (mode === 'enrollments') {
+    const { data } = await api.post<SyncSummaryResponse>(
+      `/api/v1/sync/course/${courseId}/enrollments-from-sheet`,
+      undefined,
+      { timeout: SYNC_REQUEST_TIMEOUT_MS },
+    )
+    return data
+  }
+
   const { data } = await api.post<SyncSummaryResponse>(
     `/api/v1/sync/course/${courseId}/${mode}`,
+    undefined,
+    { timeout: SYNC_REQUEST_TIMEOUT_MS },
   )
   return data
 }
@@ -181,6 +219,16 @@ export async function configureGoogleSheets(
   return data
 }
 
+export async function configureGoogleSheetsAppsScript(
+  payload: GoogleSheetsAppsScriptConfigPayload,
+): Promise<GoogleSheetsConfigSaveResponse> {
+  const { data } = await api.post<GoogleSheetsConfigSaveResponse>(
+    '/api/v1/config/google-sheets/apps-script',
+    payload,
+  )
+  return data
+}
+
 export async function triggerDriveToMoodleSync(
   courseId: number,
   payload?: {
@@ -192,6 +240,7 @@ export async function triggerDriveToMoodleSync(
   const { data } = await api.post<DriveToMoodleSyncResponse>(
     `/api/v1/sync/google-drive-to-moodle/${courseId}`,
     payload ?? {},
+    { timeout: SYNC_REQUEST_TIMEOUT_MS },
   )
   return data
 }

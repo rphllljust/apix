@@ -123,6 +123,12 @@ class GoogleSheetsOAuthConfigRequest(BaseModel):
     spreadsheet: str
 
 
+class GoogleSheetsAppsScriptConfigRequest(BaseModel):
+    spreadsheet: str
+    webhook_url: str
+    webhook_token: str | None = None
+
+
 class DriveFileItem(BaseModel):
     """Representa um arquivo do Google Drive."""
 
@@ -147,4 +153,3 @@ class DriveToMoodleSyncResult(BaseModel):
     uploaded: list[str] = Field(default_factory=list)
     failed: list[str] = Field(default_factory=list)
     duration_seconds: float
-

@@ -2,6 +2,7 @@ import { AxiosError } from 'axios'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   api,
+  configureGoogleSheetsAppsScript,
   configureGoogleSheets,
   configureMoodleToken,
   fetchGoogleSheetsConfig,
@@ -140,8 +141,38 @@ describe('api client helpers', () => {
     })
 
     const data = await triggerCourseSync(125, 'grades')
-    expect(postSpy).toHaveBeenCalledWith('/api/v1/sync/course/125/grades')
+    expect(postSpy).toHaveBeenCalledWith(
+      '/api/v1/sync/course/125/grades',
+      undefined,
+      { timeout: 180000 },
+    )
     expect(data.duration_seconds).toBe(3)
+  })
+
+  it('dispara matriculas da planilha para o ava no modo enrollments', async () => {
+    const postSpy = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        direction: 'sheets_to_moodle',
+        started_at: '2026-04-11T00:00:00Z',
+        finished_at: '2026-04-11T00:00:03Z',
+        duration_seconds: 3,
+        processed_counts: {},
+        warnings: [],
+        extra: {},
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config: { headers: {} },
+    })
+
+    const data = await triggerCourseSync(125, 'enrollments')
+    expect(postSpy).toHaveBeenCalledWith(
+      '/api/v1/sync/course/125/enrollments-from-sheet',
+      undefined,
+      { timeout: 180000 },
+    )
+    expect(data.direction).toBe('sheets_to_moodle')
   })
 
   it('configura token do Moodle', async () => {
@@ -192,11 +223,18 @@ describe('api client helpers', () => {
   it('busca configuracao do google sheets', async () => {
     const getSpy = vi.spyOn(api, 'get').mockResolvedValue({
       data: {
+        integration_mode: 'oauth',
         oauth: {
           configured: true,
           client_id_masked: '1234****abcd',
           redirect_uri: 'http://localhost:8000/api/v1/google-sheets/oauth/callback',
           refresh_token_configured: true,
+        },
+        apps_script: {
+          configured: false,
+          webhook_url: '',
+          webhook_token_configured: false,
+          timeout_seconds: 20,
         },
         spreadsheet: {
           id: '1abc',
@@ -219,6 +257,7 @@ describe('api client helpers', () => {
       data: {
         ok: true,
         message: 'Configuracao Google salva com sucesso.',
+        integration_mode: 'oauth',
         oauth: {
           configured: true,
           redirect_uri: 'http://localhost:8000/api/v1/google-sheets/oauth/callback',
@@ -246,6 +285,46 @@ describe('api client helpers', () => {
     const data = await configureGoogleSheets(payload)
     expect(postSpy).toHaveBeenCalledWith('/api/v1/config/google-sheets', payload)
     expect(data.ok).toBe(true)
+  })
+
+  it('salva configuracao do apps script', async () => {
+    const postSpy = vi.spyOn(api, 'post').mockResolvedValue({
+      data: {
+        ok: true,
+        message: 'Configuracao do Apps Script salva com sucesso.',
+        integration_mode: 'apps_script',
+        oauth: {
+          configured: false,
+          redirect_uri: 'http://localhost:8000/api/v1/google-sheets/oauth/callback',
+          refresh_token_configured: false,
+        },
+        apps_script: {
+          configured: true,
+          webhook_url: 'https://script.google.com/macros/s/abc/exec',
+          webhook_token_configured: false,
+          timeout_seconds: 20,
+        },
+        spreadsheet: {
+          id: '1abc',
+          url: 'https://docs.google.com/spreadsheets/d/1abc/edit',
+        },
+        sheets_runtime_status: 'online',
+      },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+      config: { headers: {} },
+    })
+
+    const payload = {
+      spreadsheet: 'https://docs.google.com/spreadsheets/d/1abc/edit',
+      webhook_url: 'https://script.google.com/macros/s/abc/exec',
+      webhook_token: '',
+    }
+
+    const data = await configureGoogleSheetsAppsScript(payload)
+    expect(postSpy).toHaveBeenCalledWith('/api/v1/config/google-sheets/apps-script', payload)
+    expect(data.integration_mode).toBe('apps_script')
   })
 
   it('converte erro Axios com payload estruturado', () => {

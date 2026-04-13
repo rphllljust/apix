@@ -24,7 +24,7 @@ import { Select } from '@/components/ui/select'
 import { SHEETS_ENROLLMENT_COLUMNS } from '@/constants/sheets-columns'
 import { useDebounce } from '@/hooks/use-debounce'
 import {
-  configureGoogleSheets,
+  configureGoogleSheetsAppsScript,
   configureMoodleToken,
   fetchGoogleSheetsConfig,
   fetchCourses,
@@ -32,6 +32,7 @@ import {
   fetchHealth,
   fetchSyncLogs,
   fetchSyncLogsGraphQL,
+  resolvedApiBaseUrl,
   startGoogleSheetsOAuth,
   toApiError,
   triggerCourseSync,
@@ -98,8 +99,11 @@ function sortCourses(courses: CourseItem[] | undefined): CourseItem[] {
 }
 
 export default function DashboardPage(): ReactElement {
-  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
-  const defaultGoogleRedirectUri = `${apiBaseUrl.replace(/\/$/, '')}/api/v1/google-sheets/oauth/callback`
+  const apiBaseUrl = resolvedApiBaseUrl
+  const apiBaseUrlDisplay =
+    apiBaseUrl.startsWith('/') && typeof window !== 'undefined'
+      ? `${window.location.origin}${apiBaseUrl}`
+      : apiBaseUrl
 
   const queryClient = useQueryClient()
   const selectedCourseId = useUiStore((s) => s.selectedCourseId)
@@ -116,10 +120,9 @@ export default function DashboardPage(): ReactElement {
   const [tokenInput, setTokenInput] = useState<string>('')
   const [tokenVisible, setTokenVisible] = useState<boolean>(false)
   const [isGoogleConfigModalOpen, setIsGoogleConfigModalOpen] = useState<boolean>(false)
-  const [googleClientId, setGoogleClientId] = useState<string>('')
-  const [googleClientSecret, setGoogleClientSecret] = useState<string>('')
-  const [googleClientSecretVisible, setGoogleClientSecretVisible] = useState<boolean>(false)
-  const [googleRedirectUri, setGoogleRedirectUri] = useState<string>(defaultGoogleRedirectUri)
+  const [googleAppsScriptUrl, setGoogleAppsScriptUrl] = useState<string>('')
+  const [googleAppsScriptToken, setGoogleAppsScriptToken] = useState<string>('')
+  const [googleAppsScriptTokenVisible, setGoogleAppsScriptTokenVisible] = useState<boolean>(false)
   const [googleSpreadsheetInput, setGoogleSpreadsheetInput] = useState<string>('')
   const [isDriveModalOpen, setIsDriveModalOpen] = useState<boolean>(false)
   const [driveFolderId, setDriveFolderId] = useState<string>('')
@@ -137,6 +140,7 @@ export default function DashboardPage(): ReactElement {
     formState: { errors },
   } = useForm<SyncFormInput, unknown, SyncFormOutput>({
     resolver: zodResolver(syncFormSchema),
+    mode: 'onSubmit',
     defaultValues: {
       courseId: selectedCourseId ?? undefined,
       mode: syncMode,
@@ -213,15 +217,14 @@ export default function DashboardPage(): ReactElement {
 
   const googleConfigMutation = useMutation({
     mutationFn: () =>
-      configureGoogleSheets({
-        client_id: googleClientId.trim(),
-        client_secret: googleClientSecret.trim(),
-        redirect_uri: googleRedirectUri.trim(),
+      configureGoogleSheetsAppsScript({
         spreadsheet: googleSpreadsheetInput.trim(),
+        webhook_url: googleAppsScriptUrl.trim(),
+        webhook_token: googleAppsScriptToken.trim(),
       }),
     onSuccess: () => {
-      setGoogleClientSecret('')
-      setGoogleClientSecretVisible(false)
+      setGoogleAppsScriptToken('')
+      setGoogleAppsScriptTokenVisible(false)
       setIsGoogleConfigModalOpen(false)
       void queryClient.invalidateQueries({ queryKey: ['google-sheets-config'] })
       void queryClient.invalidateQueries({ queryKey: ['health'] })
@@ -287,9 +290,10 @@ export default function DashboardPage(): ReactElement {
   const moodleStatus = healthQuery.data?.moodle?.status
   const sheetsStatus = healthQuery.data?.sheets?.status
   const isMoodleAuthError = moodleStatus === 'auth_error'
-  const googleOAuthConfigured = googleSheetsConfigQuery.data?.oauth?.configured ?? false
-  const googleRefreshConfigured =
-    googleSheetsConfigQuery.data?.oauth?.refresh_token_configured ?? false
+  const googleAppsScriptConfigured = googleSheetsConfigQuery.data?.apps_script?.configured ?? false
+  const googleAppsScriptTokenConfigured =
+    googleSheetsConfigQuery.data?.apps_script?.webhook_token_configured ?? false
+  const googleIntegrationMode = googleSheetsConfigQuery.data?.integration_mode ?? 'oauth'
 
   const onSubmit = handleSubmit((values: SyncFormOutput) => {
     setSelectedCourseId(values.courseId)
@@ -299,10 +303,9 @@ export default function DashboardPage(): ReactElement {
 
   const openGoogleConfigModal = () => {
     const currentConfig = googleSheetsConfigQuery.data
-    setGoogleClientId('')
-    setGoogleClientSecret('')
-    setGoogleClientSecretVisible(false)
-    setGoogleRedirectUri(currentConfig?.oauth.redirect_uri || defaultGoogleRedirectUri)
+    setGoogleAppsScriptUrl(currentConfig?.apps_script.webhook_url || '')
+    setGoogleAppsScriptToken('')
+    setGoogleAppsScriptTokenVisible(false)
     setGoogleSpreadsheetInput(currentConfig?.spreadsheet.url || currentConfig?.spreadsheet.id || '')
     setIsGoogleConfigModalOpen(true)
     void googleSheetsConfigQuery.refetch()
@@ -334,7 +337,7 @@ export default function DashboardPage(): ReactElement {
                 </CardTitle>
                 <CardDescription>
                   Base URL:{' '}
-                  <strong>{apiBaseUrl}</strong>
+                  <strong>{apiBaseUrlDisplay}</strong>
                 </CardDescription>
               </div>
               <div className="flex items-center gap-2">
@@ -411,8 +414,11 @@ export default function DashboardPage(): ReactElement {
                   Planilha: {googleSheetsConfigQuery.data?.spreadsheet.id || 'Nao configurada'}
                 </p>
                 <p className="text-xs text-slate-500">
-                  OAuth: {googleOAuthConfigured ? 'Configurado' : 'Pendente'} | Refresh token:{' '}
-                  {googleRefreshConfigured ? 'OK' : 'Nao autorizado'}
+                  Modo: {googleIntegrationMode === 'apps_script' ? 'Apps Script (sem Cloud)' : 'OAuth'}
+                </p>
+                <p className="text-xs text-slate-500">
+                  Apps Script: {googleAppsScriptConfigured ? 'Configurado' : 'Pendente'} | Token:{' '}
+                  {googleAppsScriptTokenConfigured ? 'OK' : 'Nao configurado'}
                 </p>
                 <div className="mt-3 grid gap-2">
                   <Button
@@ -423,9 +429,9 @@ export default function DashboardPage(): ReactElement {
                     disabled={googleConfigMutation.isPending}
                   >
                     <KeyRound className="h-4 w-4" />
-                    Configurar Google
+                    Configurar Apps Script
                   </Button>
-                  {sheetsStatus !== 'online' && (
+                  {googleIntegrationMode === 'oauth' && sheetsStatus !== 'online' && (
                     <Button
                       className="w-full"
                       variant="accent"
@@ -443,7 +449,7 @@ export default function DashboardPage(): ReactElement {
                     {googleConfigMutation.data.message}
                   </p>
                 )}
-                {sheetsOAuthMutation.isError && (
+                {googleIntegrationMode === 'oauth' && sheetsOAuthMutation.isError && (
                   <p className="mt-2 text-xs font-semibold text-red-700">
                     {toApiError(sheetsOAuthMutation.error).message}
                   </p>
@@ -535,7 +541,7 @@ export default function DashboardPage(): ReactElement {
                 >
                   <option value="full">Completo</option>
                   <option value="grades">Notas e progresso</option>
-                  <option value="enrollments">Matriculas</option>
+                  <option value="enrollments">Matriculas (Planilha para AVA)</option>
                 </Select>
               </div>
 
@@ -734,9 +740,9 @@ export default function DashboardPage(): ReactElement {
             <div className="w-full max-w-xl rounded-lg border border-line bg-panel p-5 shadow-2xl">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-lg font-bold text-ink">Configurar Google Sheets OAuth</h2>
+                  <h2 className="text-lg font-bold text-ink">Configurar Google Sheets via Apps Script</h2>
                   <p className="text-sm text-slate-600">
-                    Salve as credenciais OAuth e o link da planilha para liberar o login Google.
+                    Modo sem Google Cloud: informe a URL do Web App e o link da planilha.
                   </p>
                 </div>
                 <Button
@@ -754,42 +760,42 @@ export default function DashboardPage(): ReactElement {
                 </Button>
               </div>
 
-              {googleSheetsConfigQuery.data?.oauth.client_id_masked && (
+              {googleSheetsConfigQuery.data?.apps_script.webhook_url && (
                 <p className="mt-3 text-xs text-slate-600">
-                  Client ID atual (mascarado): {googleSheetsConfigQuery.data.oauth.client_id_masked}
+                  Webhook atual: {googleSheetsConfigQuery.data.apps_script.webhook_url}
                 </p>
               )}
 
               <div className="mt-4 space-y-2">
                 <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
-                  Google OAuth Client ID
+                  URL do Web App (Apps Script)
                 </label>
                 <Input
                   autoFocus
-                  placeholder="1234567890-abc.apps.googleusercontent.com"
-                  value={googleClientId}
-                  onChange={(event) => setGoogleClientId(event.target.value)}
+                  placeholder="https://script.google.com/macros/s/.../exec"
+                  value={googleAppsScriptUrl}
+                  onChange={(event) => setGoogleAppsScriptUrl(event.target.value)}
                 />
               </div>
 
               <div className="mt-3 space-y-2">
                 <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
-                  Google OAuth Client Secret
+                  Token do webhook (opcional)
                 </label>
                 <div className="flex gap-2">
                   <Input
-                    placeholder="Cole o client secret"
-                    type={googleClientSecretVisible ? 'text' : 'password'}
-                    value={googleClientSecret}
-                    onChange={(event) => setGoogleClientSecret(event.target.value)}
+                    placeholder="Deixe vazio se nao configurou token no Apps Script"
+                    type={googleAppsScriptTokenVisible ? 'text' : 'password'}
+                    value={googleAppsScriptToken}
+                    onChange={(event) => setGoogleAppsScriptToken(event.target.value)}
                   />
                   <Button
-                    aria-label={googleClientSecretVisible ? 'Ocultar segredo' : 'Mostrar segredo'}
+                    aria-label={googleAppsScriptTokenVisible ? 'Ocultar token' : 'Mostrar token'}
                     type="button"
                     variant="ghost"
-                    onClick={() => setGoogleClientSecretVisible((prev) => !prev)}
+                    onClick={() => setGoogleAppsScriptTokenVisible((prev) => !prev)}
                   >
-                    {googleClientSecretVisible ? (
+                    {googleAppsScriptTokenVisible ? (
                       <EyeOff className="h-4 w-4" />
                     ) : (
                       <Eye className="h-4 w-4" />
@@ -800,18 +806,7 @@ export default function DashboardPage(): ReactElement {
 
               <div className="mt-3 space-y-2">
                 <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
-                  Redirect URI
-                </label>
-                <Input
-                  placeholder="http://localhost:8000/api/v1/google-sheets/oauth/callback"
-                  value={googleRedirectUri}
-                  onChange={(event) => setGoogleRedirectUri(event.target.value)}
-                />
-              </div>
-
-              <div className="mt-3 space-y-2">
-                <label className="text-xs font-semibold uppercase tracking-wide text-slate-600">
-                  URL da planilha Google
+                  Planilha Google (URL completa)
                 </label>
                 <Input
                   placeholder="https://docs.google.com/spreadsheets/d/.../edit"
@@ -839,9 +834,7 @@ export default function DashboardPage(): ReactElement {
                   type="button"
                   disabled={
                     googleConfigMutation.isPending ||
-                    googleClientId.trim().length < 20 ||
-                    googleClientSecret.trim().length < 10 ||
-                    googleRedirectUri.trim().length < 10 ||
+                    googleAppsScriptUrl.trim().length < 20 ||
                     googleSpreadsheetInput.trim().length < 10
                   }
                   onClick={() => googleConfigMutation.mutate()}

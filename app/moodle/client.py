@@ -89,17 +89,25 @@ class MoodleClient:
         return errorcode, message, debuginfo
 
     @staticmethod
-    def _is_auth_error(errorcode: str, message: str, debuginfo: str = "") -> bool:
+    def _is_token_error(errorcode: str, message: str, debuginfo: str = "") -> bool:
         hints = f"{errorcode} {message} {debuginfo}".lower()
         return any(
             token in hints
             for token in (
-                "token",
                 "invalidtoken",
+            )
+        )
+
+    @staticmethod
+    def _is_permission_error(errorcode: str, message: str, debuginfo: str = "") -> bool:
+        hints = f"{errorcode} {message} {debuginfo}".lower()
+        return any(
+            token in hints
+            for token in (
                 "accessexception",
                 "notauthorised",
                 "nopermissions",
-                "invalidparameter",
+                "wsusercannotassign",
             )
         )
 
@@ -124,11 +132,17 @@ class MoodleClient:
                 errorcode=errorcode,
             )
 
-        if self._is_auth_error(errorcode, message, debuginfo):
+        if self._is_token_error(errorcode, message, debuginfo):
             raise MoodleTokenExpiredError(
                 errorcode=errorcode,
                 message=message,
                 debuginfo=debuginfo,
+            )
+
+        if self._is_permission_error(errorcode, message, debuginfo):
+            raise MoodleAuthError(
+                "Usuario/token sem permissao para executar esta operacao no Moodle.",
+                errorcode=errorcode,
             )
 
         permission_hints = f"{errorcode} {message} {debuginfo}".lower()
@@ -232,7 +246,7 @@ class MoodleClient:
     async def call(self, wsfunction: str, **params: Any) -> Any:
         try:
             return await self._request(wsfunction, params)
-        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError):
+        except (MoodleAPIError, MoodleConnectionError, MoodleTokenExpiredError, MoodleAuthError):
             raise
         except Exception as exc:  # pragma: no cover - fallback defensivo
             logger.error(
